@@ -14,7 +14,7 @@ If you're starting from scratch, here's how to get Z.AI's GLM models working wit
 
 ### 1. Get a Z.AI API key
 
-1. Go to [https://open.bigmodel.cn/](https://open.bigmodel.cn/)
+1. Go to [https://platform.z.ai/](https://platform.z.ai/)
 2. Sign up and get your API key
 3. Export it as an environment variable:
 
