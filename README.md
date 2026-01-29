@@ -30,6 +30,8 @@ source ~/.zshrc  # or source ~/.bashrc
 
 ```bash
 npm install -g @anthropic-ai/claude-code
+# or
+bun install -g @anthropic-ai/claude-code
 ```
 
 ### 3. Configure Codex for Z.AI
