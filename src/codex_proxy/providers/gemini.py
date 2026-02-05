@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 class GeminiProvider(BaseProvider):
-    """Provider for Google Gemini models via internal APIs."""
+    """Provider for Google Gemini models via multiple authentication types."""
 
     def __init__(self):
         self.auth = GeminiAuth()
@@ -54,8 +54,7 @@ class GeminiProvider(BaseProvider):
     def handle_compact(self, data: Dict[str, Any], handler: Any) -> None:
         """Handle context compaction using Flash models."""
         try:
-            token = self.auth.get_access_token()
-            pid = self.auth.get_project_id(token)
+            auth_ctx = self.auth.get_auth_context()
 
             # Map messages specifically for compaction
             contents, system_instruction = map_messages(
@@ -76,19 +75,31 @@ class GeminiProvider(BaseProvider):
                 }
             )
 
-            request_body = {
-                "model": "gemini-2.5-flash-lite",
-                "project": pid,
-                "request": {
-                    "contents": contents,
-                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096},
-                },
-            }
-            if system_instruction:
-                request_body["request"]["systemInstruction"] = system_instruction
+            gen_config = {"temperature": 0.1, "maxOutputTokens": 4096}
 
-            url = f"{config.gemini_api_base}/v1internal:streamGenerateContent?alt=sse"
-            headers = {"Authorization": f"Bearer {token}"}
+            if auth_ctx["type"] == "internal":
+                url = f"{config.gemini_api_internal}/v1internal:streamGenerateContent?alt=sse"
+                headers = {"Authorization": f"Bearer {auth_ctx['access_token']}"}
+                request_body = {
+                    "model": "gemini-2.5-flash-lite",
+                    "project": auth_ctx["project_id"],
+                    "request": {
+                        "contents": contents,
+                        "generationConfig": gen_config,
+                    },
+                }
+                if system_instruction:
+                    request_body["request"]["systemInstruction"] = system_instruction
+            else:
+                # Public API
+                url = f"{config.gemini_api_public}/v1beta/models/gemini-2.5-flash-lite:streamGenerateContent?alt=sse&key={auth_ctx['api_key']}"
+                headers = {}
+                request_body = {
+                    "contents": contents,
+                    "generationConfig": gen_config,
+                }
+                if system_instruction:
+                    request_body["systemInstruction"] = system_instruction
 
             resp = self.session.post(
                 url,
@@ -122,12 +133,13 @@ class GeminiProvider(BaseProvider):
             if line.startswith(b"data: "):
                 try:
                     d = json_loads(line[6:])
-                    parts = (
-                        d.get("response", {})
-                        .get("candidates", [{}])[0]
-                        .get("content", {})
-                        .get("parts", [])
+                    # Public and internal API return slightly different paths for candidates
+                    candidates = d.get("candidates") or d.get("response", {}).get(
+                        "candidates"
                     )
+                    if not candidates:
+                        continue
+                    parts = candidates[0].get("content", {}).get("parts", [])
                     for p in parts:
                         if "text" in p:
                             final_text += p["text"]
@@ -197,8 +209,7 @@ class GeminiProvider(BaseProvider):
         display_model: Optional[str] = None,
     ) -> None:
         """Inner execution logic for Gemini streaming."""
-        token = self.auth.get_access_token()
-        pid = self.auth.get_project_id(token)
+        auth_ctx = self.auth.get_auth_context()
 
         headers_dict = req_data.get("_headers") or {}
         subagent = headers_dict.get("x-openai-subagent")
@@ -211,48 +222,62 @@ class GeminiProvider(BaseProvider):
 
         display_model = display_model or model
 
-        personality = (
-            headers_dict.get("x-codex-personality") or config.default_personality
-        )
         messages = req_data.get("messages") or []
-        messages.insert(0, {"role": "system", "content": f"personality:{personality}"})
-
         contents, system_instruction = map_messages(messages, model)
         if not contents:
             contents = [{"role": "user", "parts": [{"text": "..."}]}]
 
         gen_config = self._build_gen_config(req_data, model, system_instruction)
 
-        request_body = {
-            "model": model,
-            "project": pid,
-            "user_prompt_id": f"u-{int(time.time())}",
-            "request": {
+        # Determine URL and Request Body based on Auth Type
+        if auth_ctx["type"] == "internal":
+            url = (
+                f"{config.gemini_api_internal}/v1internal:streamGenerateContent?alt=sse"
+            )
+            headers = {
+                "Authorization": f"Bearer {auth_ctx['access_token']}",
+                "User-Agent": f"GeminiCLI/0.26.0/{model} (linux; x64)",
+            }
+            request_body = {
+                "model": model,
+                "project": auth_ctx["project_id"],
+                "user_prompt_id": f"u-{int(time.time())}",
+                "request": {
+                    "contents": contents,
+                    "generationConfig": gen_config,
+                    "session_id": str(
+                        headers_dict.get("session_id")
+                        or req_data.get("conversation_id")
+                        or f"s-{int(time.time())}"
+                    ),
+                },
+            }
+            if system_instruction:
+                request_body["request"]["systemInstruction"] = system_instruction
+
+            # Apply Tools to the "request" sub-object
+            self._apply_tools(req_data, request_body["request"])
+
+            if req_data.get("store"):
+                headers["x-codex-store"] = "true"
+                ts = headers_dict.get("x-codex-turn-state")
+                if ts:
+                    headers["x-codex-turn-state"] = ts
+        else:
+            # Public API
+            url = f"{config.gemini_api_public}/v1beta/models/{model}:streamGenerateContent?alt=sse&key={auth_ctx['api_key']}"
+            headers = {
+                "User-Agent": f"GeminiCLI/0.26.0/{model} (linux; x64)",
+            }
+            request_body = {
                 "contents": contents,
                 "generationConfig": gen_config,
-                "session_id": str(
-                    headers_dict.get("session_id")
-                    or req_data.get("conversation_id")
-                    or f"s-{int(time.time())}"
-                ),
-            },
-        }
+            }
+            if system_instruction:
+                request_body["systemInstruction"] = system_instruction
 
-        if system_instruction:
-            request_body["request"]["systemInstruction"] = system_instruction
-
-        self._apply_tools(req_data, request_body)
-
-        url = f"{config.gemini_api_base}/v1internal:streamGenerateContent?alt=sse"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "User-Agent": f"GeminiCLI/0.26.0/{model} (linux; x64)",
-        }
-        if req_data.get("store"):
-            headers["x-codex-store"] = "true"
-            ts = headers_dict.get("x-codex-turn-state")
-            if ts:
-                headers["x-codex-turn-state"] = ts
+            # Apply Tools directly to the body
+            self._apply_tools(req_data, request_body)
 
         with self.session.post(
             url,
@@ -350,8 +375,8 @@ class GeminiProvider(BaseProvider):
         if effort == "xhigh" and system_instruction:
             system_instruction["parts"][0]["text"] += "\nProvide deep reasoning."
 
-    def _apply_tools(self, req_data: Dict[str, Any], request_body: Dict[str, Any]):
-        """Apply tool configuration to the request body."""
+    def _apply_tools(self, req_data: Dict[str, Any], target_dict: Dict[str, Any]):
+        """Apply tool configuration to the target dictionary (either body or 'request' sub-object)."""
         tools = []
         for t in req_data.get("tools") or []:
             f = (
@@ -369,9 +394,9 @@ class GeminiProvider(BaseProvider):
                 )
 
         if tools:
-            if "tools" not in request_body["request"]:
-                request_body["request"]["tools"] = []
-            request_body["request"]["tools"].append({"functionDeclarations": tools})
+            if "tools" not in target_dict:
+                target_dict["tools"] = []
+            target_dict["tools"].append({"functionDeclarations": tools})
 
             tc = req_data.get("tool_choice", "auto")
             mode = (
@@ -379,14 +404,12 @@ class GeminiProvider(BaseProvider):
                 if tc in ("auto", "required")
                 else ("NONE" if tc == "none" else "ANY")
             )
-            request_body["request"]["toolConfig"] = {
-                "functionCallingConfig": {"mode": mode}
-            }
+            target_dict["toolConfig"] = {"functionCallingConfig": {"mode": mode}}
 
         if "search" in (req_data.get("include") or []):
-            if "tools" not in request_body["request"]:
-                request_body["request"]["tools"] = []
-            request_body["request"]["tools"].append({"googleSearch": {}})
+            if "tools" not in target_dict:
+                target_dict["tools"] = []
+            target_dict["tools"].append({"googleSearch": {}})
 
     def _report_error(self, handler: Any, error: Exception, is_responses_api: bool):
         """Standardized error reporting."""
@@ -436,7 +459,12 @@ class GeminiProvider(BaseProvider):
                     break
                 try:
                     data = json_loads(line[6:])
-                    cand = data.get("response", {}).get("candidates", [{}])[0]
+                    candidates = data.get("candidates") or data.get("response", {}).get(
+                        "candidates"
+                    )
+                    if not candidates:
+                        continue
+                    cand = candidates[0]
                     parts = cand.get("content", {}).get("parts", [])
                     finish = cand.get("finishReason")
 

@@ -1,60 +1,91 @@
 # codex-proxy
 
-The `codex-proxy` is a high-performance bridge for the Codex CLI. It maps the specialized "Responses API" to AI providers like Z.AI and Gemini, ensuring 1:1 parity with native GPT models. It handles the low-level translation so your agentic workflows just work.
+A high-performance bridge that maps the OpenAI Responses API used by Codex to other providers like Google Gemini and Z.AI (GLM). It handles the low-level translation, role mapping, and stream formatting so you can use these models as drop-in replacements for GPT-4/5 in your agentic workflows.
 
-## What it actually does
+## Features
 
-- **Deep Parity with Responses API**: It implements the full lifecycle of OpenAI's newest API. The proxy emits rich SSE events (`response.created`, `response.output_item.added`, `response.completed`) containing all the metadata Codex expects—temperature, tool definitions, and reasoning blocks.
-- **Role Correction**: Automatically maps the `developer` role to `system`. This fixes immediate crashes on providers like Z.AI that don't support the newer role naming yet.
-- **Advanced Gemini Support**: Unlocks Gemini 2.0 and 3.0 features. It supports "thinking" blocks, strict JSON schemas, and automatically switches to a fallback model (like Flash Lite) if you hit a rate limit.
-- **History Auto-Compaction**: Background history management. When your conversation gets too long, it uses a fast Flash model to summarize the context, keeping your token usage efficient without losing the thread.
-- **Fast and Robust**: A multi-threaded Python server using `orjson` for minimal overhead and low latency.
+- **Responses API Parity**: Implements the full lifecycle of the Responses API, including metadata-rich events (`response.created`, `response.output_item.added`, etc.).
+- **Provider Compatibility**: Fixes breaking issues, such as mapping the `developer` role back to `system` and sanitizing tool parameters for older APIs.
+- **Advanced Gemini Integration**: Supports Gemini "thinking" blocks, JSON schemas, and automatic fallback to Flash models under rate limits.
+- **Unified Authentication**: Supports every `gemini-cli` authentication type (OAuth, AI Studio API Keys, Vertex AI, ADC).
+- **Context Management**: Dedicated compaction endpoint using fast Flash models to summarize history.
 
-## Supported Providers
+## Getting Started
 
-- **Gemini**: Full integration with Google's internal APIs. It manages the OAuth2 flow, discovers your Project ID, and maps reasoning effort to the correct thinking budget.
-- **Z.AI (GLM)**: Robust support for GLM models. Includes spec-compliant streaming, tool call sanitization, and automatic pruning of unsupported parameters.
-
-## The Control Script
-
-Management is handled through a single, modular tool: `scripts/control.sh`.
+Manage the proxy using the `scripts/control.sh` script.
 
 ```bash
-# Start or stop the container
+# Start the proxy in Docker
 ./scripts/control.sh start
-./scripts/control.sh stop
 
-# Monitor logs (standard Unix format)
+# Monitor logs (Standard Unix format)
 ./scripts/control.sh logs
 
-# Run a quick test against a specific Codex profile
+# Run a test command through Codex
 ./scripts/control.sh run -p glm -- "Why is the sky blue?"
 
-# Run the full integration test suite
-./scripts/control.sh test
+# Stop the proxy
+./scripts/control.sh stop
 ```
 
-## Setup
+## Configuration
 
-The proxy runs in Docker and expects Gemini credentials at `~/.gemini/oauth_creds.json`.
+The proxy loads configuration from environment variables or a JSON file at `~/.config/codex-proxy/config.json`.
 
-1. **Configuration**:
-   Manage settings via environment variables or `~/.gemini/proxy_config.json`:
-   - `Z_AI_API_KEY`: Your Z.AI key.
-   - `GEMINI_CLIENT_ID` / `SECRET`: Credentials for Gemini internal APIs.
-   - `PORT`: Defaults to `8765`.
+| Variable | Config Key | Description |
+| :--- | :--- | :--- |
+| `PORT` | `port` | Server listen port (default: 8765). |
+| `GEMINI_API_KEY` | `gemini_api_key` | Google AI Studio API Key. |
+| `Z_AI_API_KEY` | `z_ai_api_key` | Z.AI (GLM) API Key. |
+| `GEMINI_MODELS` | `gemini_models` | Comma-separated list of supported Gemini models. |
+| `GOOGLE_CLOUD_PROJECT` | - | Manual override for Google Cloud Project ID. |
 
-2. **Connecting Codex**:
-   Update your `~/.codex/config.toml` to use the proxy:
+### Configuration Example (`~/.config/codex-proxy/config.json`)
 
-   ```toml
-   [model_providers.z_ai]
-   name = "ZAI Proxy"
-   base_url = "http://localhost:8765"
-   env_key = "Z_AI_API_KEY"
-   wire_api = "responses" # Crucial: Must be responses API
+```json
+{
+  "port": 8765,
+  "gemini_api_key": "your-ai-studio-key",
+  "z_ai_api_key": "your-z-ai-key",
+  "gemini_models": ["gemini-3-flash-preview", "gemini-3-pro-preview"]
+}
+```
 
-   [profiles.glm]
-   model = "glm-4.6"
-   model_provider = "z_ai"
-   ```
+## Authentication (Gemini)
+
+The proxy is designed to be zero-config. It automatically supports all [gemini-cli authentication methods](https://github.com/google-gemini/gemini-cli/blob/main/docs/get-started/authentication.md):
+
+1.  **Standard Google Login**: Run `gemini login` on your host. The proxy automatically discovers these credentials and handles the OAuth2 refresh flow using the official Gemini CLI client identity.
+2.  **AI Studio (API Key)**: Set `GEMINI_API_KEY`. The proxy will automatically switch to the Google AI public API.
+3.  **Service Accounts**: Set `GOOGLE_APPLICATION_CREDENTIALS` to your JSON key path.
+4.  **Application Default Credentials (ADC)**: Works automatically in GCP environments (GCE, Cloud Shell) or via `gcloud auth application-default login`.
+5.  **Vertex AI**: Works natively if you provide a `GOOGLE_CLOUD_PROJECT` and have authenticated via ADC or Service Account.
+
+## Connecting to Codex
+
+Update your `~/.codex/config.toml` to point to the proxy.
+
+### Z.AI (GLM)
+```toml
+[model_providers.z_ai]
+name = "ZAI Proxy"
+base_url = "http://localhost:8765"
+env_key = "Z_AI_API_KEY"
+wire_api = "responses"
+
+[profiles.glm]
+model = "glm-4.6"
+model_provider = "z_ai"
+```
+
+### Gemini
+```toml
+[model_providers.gemini_proxy]
+name = "Gemini Proxy"
+base_url = "http://localhost:8765"
+wire_api = "responses"
+
+[profiles.gemini]
+model = "gemini-3-pro-preview"
+model_provider = "gemini_proxy"
+```

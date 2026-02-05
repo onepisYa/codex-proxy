@@ -43,8 +43,11 @@ class ZAIStreamHandler:
 
         self.full_content = ""
         self.message: Optional[Dict[str, Any]] = None
-        self.item_id: Optional[str] = None
+        self.message_idx: int = -1
         self.idx: int = 0
+
+        self.tool_calls: Dict[int, Dict[str, Any]] = {}
+        self.output_items: List[Dict[str, Any]] = []
 
     def _send_event(self, evt_type: str, data: Dict[str, Any]) -> None:
         """Serialize and send a single SSE event."""
@@ -102,10 +105,60 @@ class ZAIStreamHandler:
         """Parse a single ZAI stream line and emit corresponding Codex events."""
         try:
             data = json_loads(json_data)
-            choice = data.get("choices", [{}])[0]
-            delta = choice.get("delta", {})
-            content = delta.get("content", "")
 
+            # Debug log for raw ZAI stream
+            logger.debug(f"ZAI STREAM DELTA: {data}")
+
+            choices = data.get("choices", [])
+            if not choices:
+                return
+            choice = choices[0]
+            delta = choice.get("delta", {})
+
+            # 1. Handle Tool Calls
+            if "tool_calls" in delta:
+                for tc_delta in delta["tool_calls"]:
+                    idx = tc_delta.get("index", 0)
+                    if idx not in self.tool_calls:
+                        output_idx = self.idx
+                        self.idx += 1
+                        call_id = (
+                            tc_delta.get("id")
+                            or f"call_{int(time.time() * 1000)}_{output_idx}"
+                        )
+
+                        tool_call = {
+                            "id": call_id,
+                            "type": "function_call",
+                            "status": "in_progress",
+                            "name": "",
+                            "arguments": "",
+                            "call_id": call_id,
+                        }
+                        self.tool_calls[idx] = {"item": tool_call, "index": output_idx}
+
+                        self._send_event(
+                            "response.output_item.added",
+                            {
+                                "response_id": self.resp_id,
+                                "output_index": output_idx,
+                                "item": tool_call,
+                            },
+                        )
+
+                    tc = self.tool_calls[idx]["item"]
+                    fn_delta = tc_delta.get("function", {})
+                    if "name" in fn_delta:
+                        tc["name"] += fn_delta["name"]
+                    if "arguments" in fn_delta:
+                        args_part = fn_delta["arguments"]
+                        if isinstance(args_part, dict):
+                            # If they sent an object instead of a string, stringify it
+                            args_part = json.dumps(args_part)
+                        tc["arguments"] += args_part
+
+            # 2. Handle Content
+            content = delta.get("content", "")
             if content:
                 self.full_content += content
 
@@ -117,20 +170,22 @@ class ZAIStreamHandler:
                     {
                         "response_id": self.resp_id,
                         "item_id": self.item_id,
-                        "output_index": self.idx,
+                        "output_index": self.message_idx,
                         "content_index": 0,
                         "delta": content,
                     },
                 )
-                # Keep local state updated
                 if self.message:
                     self.message["content"][0]["text"] = self.full_content
+
         except Exception as e:
             logger.debug(f"Failed to parse ZAI stream line: {e}")
 
     def _init_message(self) -> None:
         """Initialize the assistant message item."""
-        self.item_id = f"msg_{int(time.time() * 1000)}_{self.idx}"
+        self.message_idx = self.idx
+        self.idx += 1
+        self.item_id = f"msg_{int(time.time() * 1000)}_{self.message_idx}"
         self.message = {
             "id": self.item_id,
             "type": "message",
@@ -142,31 +197,49 @@ class ZAIStreamHandler:
             "response.output_item.added",
             {
                 "response_id": self.resp_id,
-                "output_index": self.idx,
+                "output_index": self.message_idx,
                 "item": self.message,
             },
         )
 
     def _finalize(self, response_obj: Dict[str, Any]) -> None:
         """Emit completion events and close the response."""
-        if self.message is not None:
-            self.message["status"] = "completed"
+        items_to_close = []
+        if self.message:
+            items_to_close.append((self.message_idx, self.message))
+        for tc_data in self.tool_calls.values():
+            items_to_close.append((tc_data["index"], tc_data["item"]))
+
+        items_to_close.sort(key=lambda x: x[0])
+
+        final_output = []
+        for out_idx, item in items_to_close:
+            item["status"] = "completed"
+
+            if item.get("type") == "function_call":
+                if item["name"] in ("shell", "container.exec", "shell_command"):
+                    item["type"] = "local_shell_call"
+                    try:
+                        args = json.loads(item["arguments"])
+                        item["action"] = {
+                            "type": "exec",
+                            "command": args.get("command", []),
+                        }
+                    except:
+                        pass
+
             self._send_event(
                 "response.output_item.done",
-                {
-                    "response_id": self.resp_id,
-                    "output_index": self.idx,
-                    "item": self.message,
-                },
+                {"response_id": self.resp_id, "output_index": out_idx, "item": item},
             )
+            final_output.append(item)
 
-        # Update response object for completion
         response_obj.update(
             {
                 "status": "completed",
                 "completed_at": int(time.time()),
                 "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                "output": [self.message] if self.message is not None else [],
+                "output": final_output,
             }
         )
 

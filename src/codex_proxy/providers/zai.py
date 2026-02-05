@@ -55,6 +55,8 @@ class ZAIProvider(BaseProvider):
             payload["temperature"] = data["temperature"]
         if "top_p" in data:
             payload["top_p"] = data["top_p"]
+        if "max_tokens" in data:
+            payload["max_tokens"] = data["max_tokens"]
         return payload
 
     def _transform_payload(self, payload: Dict[str, Any]) -> None:
@@ -64,27 +66,46 @@ class ZAIProvider(BaseProvider):
             if m.get("role") == "developer":
                 m["role"] = "system"
 
-        # 2. Filter and Clean Tools
-        if "tools" in payload:
-            payload["tools"] = [
-                tool for tool in payload["tools"] if tool.get("type") == "function"
-            ]
+        # 2. Transform and Clean Tools
+        if "tools" in payload and payload["tools"]:
+            transformed_tools = []
             for tool in payload["tools"]:
-                if "strict" in tool:
-                    del tool["strict"]
+                ttype = tool.get("type")
+                if ttype == "function":
+                    # Remove non-standard "strict" property
+                    if "strict" in tool:
+                        del tool["strict"]
+                    transformed_tools.append(tool)
+                elif ttype == "web_search":
+                    # Transform Codex web_search to Z.AI format
+                    transformed_tools.append(
+                        {
+                            "type": "web_search",
+                            "web_search": {
+                                "enable": True,
+                                "search_engine": "search_pro_jina",
+                            },
+                        }
+                    )
+                # Drop retrieval for now as it needs knowledge_id
+
+            payload["tools"] = transformed_tools
 
     def _execute_request(
         self, payload: Dict[str, Any], original_data: Dict[str, Any], handler: Any
     ) -> None:
         """Perform the actual API call and handle response."""
-        auth_header = handler.headers.get("Authorization", "")
+        auth_header = handler.headers.get("Authorization")
+        if not auth_header and config.z_ai_api_key:
+            auth_header = f"Bearer {config.z_ai_api_key}"
+
         stream = payload.get("stream", False)
 
         try:
             with self.session.post(
                 config.z_ai_url,
                 json=payload,
-                headers={"Authorization": auth_header},
+                headers={"Authorization": auth_header} if auth_header else {},
                 stream=stream,
                 timeout=(10, 600),
             ) as resp:
@@ -132,6 +153,45 @@ class ZAIProvider(BaseProvider):
         message = choice["message"]
         usage = z_data.get("usage", {})
 
+        # Map tool calls if present
+        output_items = []
+        if "tool_calls" in message:
+            for tc in message["tool_calls"]:
+                item = {
+                    "id": tc.get("id"),
+                    "type": "function_call",
+                    "status": "completed",
+                    "name": tc["function"]["name"],
+                    "arguments": json.dumps(tc["function"]["arguments"]),
+                    "call_id": tc.get("id"),
+                }
+                # Parity with Gemini shell mapping
+                if item["name"] in ("shell", "container.exec", "shell_command"):
+                    item["type"] = "local_shell_call"
+                    try:
+                        args = tc["function"]["arguments"]
+                        if isinstance(args, str):
+                            args = json.loads(args)
+                        item["action"] = {
+                            "type": "exec",
+                            "command": args.get("command", []),
+                        }
+                    except:
+                        pass
+                output_items.append(item)
+
+        # Map content if present
+        if message.get("content"):
+            output_items.append(
+                {
+                    "id": f"msg_{int(time.time() * 1000)}",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "text", "text": message["content"]}],
+                }
+            )
+
         resp_obj = {
             "id": f"zai_{z_data.get('id')}",
             "object": "response",
@@ -143,12 +203,6 @@ class ZAIProvider(BaseProvider):
                 "completion_tokens": usage.get("completion_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
             },
-            "output": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": message.get("content", "")}],
-                }
-            ],
+            "output": output_items,
         }
         handler.wfile.write(json_dumps(resp_obj))
