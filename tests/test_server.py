@@ -168,16 +168,20 @@ class TestCompactionRequests:
             "/v1/responses/compact",
         )
 
+        # Force compaction model to ensure ZAI provider is selected
         with patch(
-            "codex_proxy.providers.zai.ZAIProvider.handle_compact"
-        ) as mock_compact:
+            "codex_proxy.server.config.compaction_model", "glm-compaction-model"
+        ):
             with patch(
-                "codex_proxy.providers.gemini.GeminiProvider.handle_request"
-            ) as mock_request:
-                handler._handle_post()
-                # Should call handle_compact, not handle_request
-                mock_compact.assert_called_once()
-                mock_request.assert_not_called()
+                "codex_proxy.providers.zai.ZAIProvider.handle_compact"
+            ) as mock_compact:
+                with patch(
+                    "codex_proxy.providers.gemini.GeminiProvider.handle_request"
+                ) as mock_request:
+                    handler._handle_post()
+                    # Should call handle_compact, not handle_request
+                    mock_compact.assert_called_once()
+                    mock_request.assert_not_called()
 
     def test_compact_validation_error(self, reset_registry):
         """Test that invalid compact request returns 400."""
