@@ -25,7 +25,7 @@ cd codex-proxy
 # Start proxy (Docker)
 ./scripts/control.sh start
 
-# Or run directly (Python 3.11+ required)
+# Or run directly (Python 3.14+ required)
 python -m codex_proxy
 ```
 
