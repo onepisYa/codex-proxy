@@ -1,6 +1,5 @@
 """Unit tests for configuration management."""
 
-import json
 import pytest
 from codex_proxy.config import Config, ConfigurationError
 
