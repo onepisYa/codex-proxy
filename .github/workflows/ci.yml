@@ -30,7 +30,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r config/requirements-dev.txt
+          pip install -r config/requirements.txt
 
       - name: Run linting
         run: |
