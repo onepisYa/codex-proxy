@@ -31,8 +31,7 @@ pub fn validate_responses_request(req: &ResponsesRequest) -> Result<(), ProxyErr
     Ok(())
 }
 
-pub fn validate_compact_request(req: &CompactRequest) -> Result<(), ProxyError> {
-    validate_input(&req.input)?;
+pub fn validate_compact_request(_req: &CompactRequest) -> Result<(), ProxyError> {
     Ok(())
 }
 
@@ -48,14 +47,7 @@ fn validate_model(model: &str) -> Result<(), ProxyError> {
 fn validate_input(input: &ResponsesInput) -> Result<(), ProxyError> {
     match input {
         ResponsesInput::Text(_) => Ok(()),
-        ResponsesInput::Items(items) => {
-            if items.len() > 100 {
-                return Err(ProxyError::Validation(
-                    "Compaction input exceeds maximum length of 100 messages".into(),
-                ));
-            }
-            Ok(())
-        }
+        ResponsesInput::Items(_) => Ok(()),
     }
 }
 
