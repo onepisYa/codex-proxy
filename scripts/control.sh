@@ -3,15 +3,18 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 # --- Utility Functions ---
 usage() {
     echo "Usage: $0 <command> [options]"
     echo
     echo "Commands:"
-    echo "  start         - Start the proxy container in detached mode."
-    echo "  stop          - Stop and remove the proxy container."
-    echo "  logs          - Follow the logs of the proxy container."
+    echo "  start         - Start the proxy server."
     echo "  test          - Run the pytest test suite."
+    echo "  lint          - Run ruff and mypy."
+    echo "  format        - Format code with ruff."
     echo "  run           - Run a codex command through the proxy."
     echo
     echo "Options for 'run' command:"
@@ -29,30 +32,27 @@ if [[ -z "$COMMAND" ]]; then
 fi
 shift
 
+cd "$PROJECT_ROOT"
+
 case "$COMMAND" in
     start)
-        echo "Starting proxy container..."
-        docker-compose -f config/docker-compose.yml up -d --build
-        ;;
-    stop)
-        echo "Stopping proxy container..."
-        docker-compose -f config/docker-compose.yml down
-        ;;
-    logs)
-        echo "Following logs..."
-        docker-compose -f config/docker-compose.yml logs -f
+        echo "Starting codex-proxy..."
+        uv run python -m codex_proxy
         ;;
     test)
         echo "Running tests..."
-        if ! command -v pytest &> /dev/null; then
-            echo "Error: pytest not found. Install with: pip install pytest pytest-responses"
-            exit 1
-        fi
-        pytest tests/ -v
+        uv run pytest tests/ -v
         ;;
-
+    lint)
+        echo "Running linters..."
+        uv run ruff check src/ tests/
+        uv run mypy src/ || true
+        ;;
+    format)
+        echo "Formatting code..."
+        uv run ruff format src/ tests/
+        ;;
     run)
-        # --- `run` command logic (from debug_run.sh) ---
         PROFILE=""
         while [[ "$#" -gt 0 ]]; do
             case $1 in
@@ -75,13 +75,15 @@ case "$COMMAND" in
             esac
         done
 
-        echo "Rebuilding and restarting proxy..."
-        docker-compose -f config/docker-compose.yml up -d --build
+        echo "Starting proxy in background..."
+        uv run python -m codex_proxy &
+        PROXY_PID=$!
+        echo "Proxy PID: $PROXY_PID"
         echo "Waiting for proxy to be ready..."
         sleep 2
 
         echo "--------------------------------------------------------"
-        echo "Running Codex test..."
+        echo "Running Codex..."
         if [[ -n "$PROFILE" ]]; then
             echo "Using profile: $PROFILE"
         fi
@@ -89,6 +91,7 @@ case "$COMMAND" in
 
         if ! command -v codex &> /dev/null; then
             echo "Error: 'codex' command not found in PATH."
+            kill "$PROXY_PID" 2>/dev/null || true
             exit 1
         fi
 
@@ -97,10 +100,11 @@ case "$COMMAND" in
             CMD="$CMD -p $PROFILE"
         fi
 
-        $CMD -- "$@"
+        $CMD -- "$@" || true
 
         echo "--------------------------------------------------------"
-        echo "Test complete. Check 'docker logs codex-proxy' for details."
+        echo "Stopping proxy..."
+        kill "$PROXY_PID" 2>/dev/null || true
         ;;
     *)
         usage

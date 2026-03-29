@@ -13,20 +13,40 @@ Translates OpenAI's Responses API to Gemini and Z.AI APIs. Handles wire format d
 - **Multi-Provider** - Gemini (OAuth2) and Z.AI (GLM) support
 - **Context Compaction** - Both Gemini and Z.AI models support
 - **Tool Support** - Function calling and web search
-- **Docker Ready** - Production container with hot-reload
 
 ## Quick Start
 
+Requires [uv](https://docs.astral.sh/uv/) and Python 3.14+.
+
 ```bash
-# Clone and start
 git clone https://github.com/cornellsh/codex-proxy.git
 cd codex-proxy
 
-# Start proxy (Docker)
-./scripts/control.sh start
+# Install dependencies
+uv sync
 
-# Or run directly (Python 3.14+ required)
-python -m codex_proxy
+# Start the proxy
+uv run python -m codex_proxy
+# or
+uv run codex-proxy
+```
+
+## Development
+
+```bash
+# Run tests
+uv run pytest tests/ -v
+
+# Lint
+uv run ruff check src/ tests/
+
+# Format
+uv run ruff format src/ tests/
+
+# Or use make
+make test
+make lint
+make format
 ```
 
 ## Configuration
