@@ -94,6 +94,28 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     def _handle_post(self):
         logger.info(f"POST {self.path}")
 
+        # Config UI save endpoint
+        if self.path == "/config":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length) if content_length else b"{}"
+            try:
+                data = json_loads(body)
+                result = _ui.apply_and_save(data)
+                resp = json.dumps(result).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+            except (ValueError, TypeError) as e:
+                err = json.dumps({"error": str(e)}).encode("utf-8")
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(err)))
+                self.end_headers()
+                self.wfile.write(err)
+            return
+
         if self.path not in (
             "/v1/responses",
             "/responses",
