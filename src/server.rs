@@ -1,10 +1,10 @@
 use axum::body::Body;
-use axum::http::{HeaderMap, header, StatusCode, Method};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use tower_http::cors::{CorsLayer, Any};
+use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::config::CONFIG;
@@ -37,7 +37,9 @@ async fn ui_handler() -> Response<Body> {
     ui::get_html()
 }
 
-async fn config_post_handler(Json(_data): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn config_post_handler(
+    Json(_data): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Config save is a stub for now — returns current config
     Ok(Json(ui::get_current_config()))
 }
@@ -69,8 +71,13 @@ async fn compact_handler(
 ) -> Result<Response<Body>, ProxyError> {
     validator::validate_request(&data, "/v1/responses/compact")?;
 
-    let compaction_model = CONFIG.compaction_model.as_deref()
-        .unwrap_or_else(|| CONFIG.models.first().map(|s| s.as_str()).unwrap_or("gemini-2.5-flash-lite"));
+    let compaction_model = CONFIG.compaction_model.as_deref().unwrap_or_else(|| {
+        CONFIG
+            .models
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("gemini-2.5-flash-lite")
+    });
 
     let provider = providers::get_provider(compaction_model);
     provider.handle_compact(data, headers).await

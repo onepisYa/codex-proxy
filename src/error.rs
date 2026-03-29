@@ -47,15 +47,26 @@ impl IntoResponse for ProxyError {
             ProxyError::Validation(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
             ProxyError::Provider(msg) => (StatusCode::BAD_GATEWAY, "provider_error", msg.clone()),
             ProxyError::Auth(msg) => (StatusCode::UNAUTHORIZED, "auth_error", msg.clone()),
-            ProxyError::Config(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "config_error", msg.to_string()),
+            ProxyError::Config(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config_error",
+                msg.to_string(),
+            ),
             ProxyError::Http(e) => {
-                let status = e.status().map(|s| {
-                    let u16_val: u16 = s.as_u16();
-                    StatusCode::from_u16(u16_val).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-                }).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let status = e
+                    .status()
+                    .map(|s| {
+                        let u16_val: u16 = s.as_u16();
+                        StatusCode::from_u16(u16_val).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+                    })
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 (status, "http_error", e.to_string())
             }
-            ProxyError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_server_error", msg.clone()),
+            ProxyError::Internal(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_server_error",
+                msg.clone(),
+            ),
         };
 
         let body = json!({

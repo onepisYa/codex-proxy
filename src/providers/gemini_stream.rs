@@ -1,6 +1,6 @@
 use bytes::Bytes;
-use futures::stream::Stream;
 use futures::StreamExt;
+use futures::stream::Stream;
 use regex::Regex;
 use serde_json::{Value, json};
 use std::pin::Pin;
@@ -11,7 +11,10 @@ use crate::config::CONFIG;
 
 pub fn stream_responses_sse(
     byte_stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-    resp_id: &str, model: &str, created_ts: i64, request_metadata: &Value,
+    resp_id: &str,
+    model: &str,
+    created_ts: i64,
+    request_metadata: &Value,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     let resp_id = resp_id.to_string();
     let model = model.to_string();
@@ -63,7 +66,7 @@ pub fn stream_responses_sse(
                     let it = usage.get("promptTokenCount").and_then(|v| v.as_u64()).unwrap_or(0);
                     let ot = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()).unwrap_or(0);
                     let rt = usage.get("thinkingTokenCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                    final_usage = Some(json!({"input_tokens": it, "input_tokens_details": {"cached_tokens": usage.get("cachedContentTokenCount").and_then(|v| v.as_u64()).unwrap_or(0)}, "output_tokens": ot, "output_tokens_details": {"reasoning_tokens": rt}, "total_tokens": it + ot}));
+                    final_usage = Some(json!({"input_tokens": it, "input_tokens_details": {"cached_tokens": usage.get("cachedContentTokenCount").and_then(|v| v.as_u64()).unwrap_or(0)}, "output_tokens": ot, "output_tokens_details": {"reasoning_tokens": rt}, "total_tokens": it + ot + rt}));
                 }
 
                 let candidates = match resp_part.get("candidates").and_then(|c| c.as_array()) { Some(c) if !c.is_empty() => c, _ => continue };

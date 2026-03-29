@@ -21,7 +21,9 @@ async fn main() {
     print_startup_info();
 
     let app = build_router();
-    let listener = tokio::net::TcpListener::bind(&addr).await.expect("Failed to bind");
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("Failed to bind");
     info!("Server bound to {addr}");
 
     axum::serve(listener, app)

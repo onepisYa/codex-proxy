@@ -16,19 +16,17 @@ Translates OpenAI's Responses API to Gemini and Z.AI APIs. Handles wire format d
 
 ## Quick Start
 
-Requires [uv](https://docs.astral.sh/uv/) and Python 3.14+.
+Requires [Rust](https://www.rust-lang.org/tools/install) (edition 2024).
 
 ```bash
 git clone https://github.com/cornellsh/codex-proxy.git
 cd codex-proxy
 
-# Install dependencies
-uv sync
+# Build
+cargo build --release
 
 # Start the proxy
-uv run python -m codex_proxy
-# or
-uv run codex-proxy
+cargo run --release
 ```
 
 ## Codex Configuration
@@ -49,22 +47,29 @@ api_key = "dummy"
 requires_openai_auth = false
 ```
 
+Notes:
+- For GLM/Z.AI models (e.g. `glm-5`), set `CODEX_PROXY_ZAI_API_KEY` so the proxy can authenticate upstream.
+- Alternatively, set `requires_openai_auth = true` and put your Z.AI token in `api_key` so Codex forwards it as the `Authorization` header.
+
 ## Development
 
 ```bash
-# Run tests
-uv run pytest tests/ -v
+# Build
+cargo build
 
-# Lint
-uv run ruff check src/ tests/
+# Run tests
+cargo test
+
+# Lint (clippy)
+cargo clippy -- -D warnings
 
 # Format
-uv run ruff format src/ tests/
+cargo fmt
 
 # Or use make
+make build
 make test
-make lint
-make format
+make check
 ```
 
 ## Configuration

@@ -1,6 +1,6 @@
 use bytes::Bytes;
-use futures::stream::Stream;
 use futures::StreamExt;
+use futures::stream::Stream;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -24,6 +24,7 @@ pub fn stream_responses_sse(
         let mut message_idx: i64 = -1;
         let mut next_idx: usize = 0;
         let mut tool_calls: HashMap<usize, (Value, usize)> = HashMap::new();
+        let mut final_usage: Option<Value> = None;
 
         fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
         fn now_secs() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) }
@@ -78,6 +79,11 @@ pub fn stream_responses_sse(
                 };
                 debug!("ZAI STREAM DELTA: {}", data_str);
 
+                if let Some(usage) = data.get("usage") {
+                    let it = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let ot = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    final_usage = Some(json!({"input_tokens": it, "output_tokens": ot, "total_tokens": it + ot}));
+                }
                 let choices = match data.get("choices").and_then(|c| c.as_array()) {
                     Some(c) if !c.is_empty() => c,
                     _ => continue,
@@ -204,7 +210,7 @@ pub fn stream_responses_sse(
         let obj = final_resp.as_object_mut().unwrap();
         obj.insert("status".into(), json!("completed"));
         obj.insert("completed_at".into(), json!(now_secs()));
-        obj.insert("usage".into(), json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}));
+        obj.insert("usage".into(), final_usage.unwrap_or(json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})));
         obj.insert("output".into(), json!(final_output));
 
         yield Ok(send_event("response.completed", json!({"response": final_resp})));
