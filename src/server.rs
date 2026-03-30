@@ -4,21 +4,24 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use once_cell::sync::Lazy;
+use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::account_pool::{AccountPool, Router as AccountRouter, RoutingState};
+use crate::account_pool::{AccountPool, RouteCandidate, Router as AccountRouter, RoutingState};
 use crate::config::CONFIG;
 use crate::error::ProxyError;
 use crate::normalizer;
 use crate::providers;
 use crate::providers::base::ProviderExecutionContext;
-use crate::schema::openai::{CompactRequest, ResponsesRequest};
+use crate::schema::openai::{ChatMessage, CompactRequest, ResponsesRequest};
 use crate::ui;
 use crate::validator;
 
 static ACCOUNT_POOL: Lazy<AccountPool> = Lazy::new(AccountPool::new);
 static ROUTING_STATE: Lazy<RoutingState> = Lazy::new(RoutingState::new);
+static RECOVERY_PROBES_STARTED: Lazy<std::sync::atomic::AtomicBool> =
+    Lazy::new(|| std::sync::atomic::AtomicBool::new(false));
 
 pub fn build_router() -> Router {
     providers::initialize_registry();
@@ -42,7 +45,6 @@ pub fn build_router() -> Router {
 
 fn initialize_runtime_state() {
     ACCOUNT_POOL.configure_health(CONFIG.routing.health.clone());
-    ACCOUNT_POOL.load_model_overrides(CONFIG.routing.model_overrides.clone());
     ACCOUNT_POOL.load_accounts(
         CONFIG
             .accounts
@@ -51,6 +53,71 @@ fn initialize_runtime_state() {
             .map(Into::into)
             .collect(),
     );
+    start_recovery_probe_loop();
+}
+
+fn start_recovery_probe_loop() {
+    use std::sync::atomic::Ordering;
+
+    if RECOVERY_PROBES_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            run_recovery_probe_pass().await;
+        }
+    });
+}
+
+async fn run_recovery_probe_pass() {
+    for index in ACCOUNT_POOL.recovery_candidates() {
+        if !ACCOUNT_POOL.begin_recovery_probe(index) {
+            continue;
+        }
+
+        let Some((account, snapshot)) = ACCOUNT_POOL.get_account(index) else {
+            ACCOUNT_POOL.finish_recovery_probe(index, false);
+            continue;
+        };
+
+        let provider = providers::get_provider(account.provider);
+        let route = crate::account_pool::ResolvedRoute {
+            requested_model: "__recovery_probe__".into(),
+            logical_model: "__recovery_probe__".into(),
+            upstream_model: account
+                .models
+                .as_ref()
+                .and_then(|models| models.first().cloned())
+                .or_else(|| {
+                    CONFIG
+                        .provider_catalog(account.provider)
+                        .and_then(|models| models.first().cloned())
+                })
+                .unwrap_or_else(|| "__probe__".into()),
+            endpoint: None,
+            provider: account.provider,
+            account_index: index,
+            account_id: account.id.clone(),
+            cache_hit: false,
+            cache_key: 0,
+            preferred_target_index: usize::MAX,
+            reasoning: Some(crate::config::EffectiveReasoningConfig {
+                budget: 0,
+                level: "LOW".into(),
+                preset: Some("none".into()),
+            }),
+        };
+        let context = ProviderExecutionContext { route, account };
+        let success = provider.probe_account(context).await.is_ok();
+        ACCOUNT_POOL.finish_recovery_probe(index, success);
+
+        if !success && !snapshot.alive {
+            warn!("Recovery probe failed for account index {}", index);
+        }
+    }
 }
 
 async fn ui_handler() -> Response<Body> {
@@ -87,7 +154,7 @@ async fn responses_handler(
     }
 
     let normalized = normalizer::normalize(data.clone());
-    let route = resolve_route(&data.model, &normalized.messages)?;
+    let route = resolve_response_route(&data.model, &normalized.messages)?;
     let provider = providers::get_provider(route.provider);
     let (account, _) = ACCOUNT_POOL
         .get_account(route.account_index)
@@ -109,13 +176,8 @@ async fn compact_handler(
 ) -> Result<Response<Body>, ProxyError> {
     validator::validate_compact_request(&data)?;
 
-    let compaction_model = CONFIG.compaction_model().ok_or_else(|| {
-        ProxyError::Config(crate::error::ConfigError::InvalidValue(
-            "models.compaction_model is not configured and no served model fallback exists".into(),
-        ))
-    })?;
     let normalized = normalizer::normalize(ResponsesRequest {
-        model: compaction_model.to_string(),
+        model: "__compaction__".to_string(),
         input: Some(data.input.clone()),
         instructions: None,
         previous_response_id: None,
@@ -129,7 +191,7 @@ async fn compact_handler(
         stream: Some(false),
         include: None,
     });
-    let route = resolve_route(compaction_model, &normalized.messages)?;
+    let route = resolve_compaction_route(&normalized.messages)?;
     let provider = providers::get_provider(route.provider);
     let (account, _) = ACCOUNT_POOL
         .get_account(route.account_index)
@@ -145,25 +207,39 @@ async fn compact_handler(
     apply_routing_result(&context, result)
 }
 
-fn resolve_route(
+fn resolve_response_route(
     requested_model: &str,
-    messages: &[crate::schema::openai::ChatMessage],
+    messages: &[ChatMessage],
 ) -> Result<crate::account_pool::ResolvedRoute, ProxyError> {
-    let upstream_model = ACCOUNT_POOL.resolve_model(requested_model);
-    let provider = CONFIG.provider_for_model(&upstream_model).ok_or_else(|| {
-        ProxyError::Validation(format!(
-            "Could not resolve provider for model '{}'",
-            upstream_model
-        ))
-    })?;
-    AccountRouter::resolve_route(
-        &ACCOUNT_POOL,
-        &ROUTING_STATE,
-        requested_model,
-        upstream_model,
-        provider,
-        messages,
-    )
+    let logical_model = CONFIG.resolve_logical_model(requested_model);
+    let targets = CONFIG
+        .preferred_targets_for_model(requested_model)
+        .ok_or_else(|| {
+            ProxyError::Validation(format!(
+                "No preferred route targets configured for logical model '{}'",
+                logical_model
+            ))
+        })?;
+    let candidates =
+        AccountRouter::build_candidates(requested_model, &logical_model, targets, |target| {
+            CONFIG
+                .resolve_reasoning(target.reasoning.as_ref())
+                .map_err(ProxyError::Config)
+        })?;
+    AccountRouter::resolve_route(&ACCOUNT_POOL, &ROUTING_STATE, &candidates, messages)
+}
+
+fn resolve_compaction_route(
+    messages: &[ChatMessage],
+) -> Result<crate::account_pool::ResolvedRoute, ProxyError> {
+    let targets = CONFIG.compaction_targets();
+    let candidates: Vec<RouteCandidate> =
+        AccountRouter::build_candidates("__compaction__", "__compaction__", targets, |target| {
+            CONFIG
+                .resolve_reasoning(target.reasoning.as_ref())
+                .map_err(ProxyError::Config)
+        })?;
+    AccountRouter::resolve_route(&ACCOUNT_POOL, &ROUTING_STATE, &candidates, messages)
 }
 
 fn apply_routing_result(
@@ -174,7 +250,7 @@ fn apply_routing_result(
         Ok(response) => {
             ACCOUNT_POOL.mark_success(context.route.account_index);
             if CONFIG.routing.sticky_routing.enabled {
-                ROUTING_STATE.bind_on_success(context.route.cache_key, context.route.account_index);
+                ROUTING_STATE.bind_on_success(&context.route);
             }
             Ok(response)
         }

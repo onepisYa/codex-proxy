@@ -40,16 +40,15 @@ pub struct UiServerConfig {
 #[derive(Clone, Debug, Serialize)]
 pub struct UiModelsConfig {
     pub served: Vec<String>,
-    pub compaction_model: String,
     pub fallback_models: std::collections::HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct UiRoutingConfig {
     pub model_overrides: std::collections::HashMap<String, String>,
+    pub preferred_models: std::collections::HashMap<String, Vec<crate::config::RouteTargetConfig>>,
     pub sticky_routing: crate::config::StickyRoutingConfig,
     pub health: crate::config::RoutingHealthConfig,
-    pub provider_prefixes: std::collections::HashMap<String, crate::account_pool::AccountProvider>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -75,14 +74,13 @@ pub fn get_current_config(account_pool: &AccountPool, routing_state: &RoutingSta
         providers: CONFIG.providers.clone(),
         models: UiModelsConfig {
             served: CONFIG.models.served.clone(),
-            compaction_model: CONFIG.compaction_model().unwrap_or_default().to_string(),
             fallback_models: CONFIG.models.fallback_models.clone(),
         },
         routing: UiRoutingConfig {
             model_overrides: CONFIG.routing.model_overrides.clone(),
+            preferred_models: CONFIG.routing.preferred_models.clone(),
             sticky_routing: CONFIG.routing.sticky_routing.clone(),
             health: CONFIG.routing.health.clone(),
-            provider_prefixes: CONFIG.routing.provider_prefixes.clone(),
         },
         accounts: account_pool.all_accounts_snapshot(),
         reasoning: CONFIG.reasoning.clone(),

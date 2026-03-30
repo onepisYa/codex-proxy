@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 use crate::account_pool::AccountAuth;
-use crate::config::CONFIG;
+use crate::config::{CONFIG, EffectiveReasoningConfig};
 use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::json_value::JsonValue;
@@ -35,6 +35,35 @@ impl ZAIProvider {
         }
     }
 
+    fn resolve_endpoint_url(
+        &self,
+        context: &ProviderExecutionContext,
+    ) -> Result<String, ProxyError> {
+        CONFIG
+            .endpoint_url(
+                crate::account_pool::AccountProvider::Zai,
+                context.endpoint_name(),
+            )
+            .map_err(ProxyError::Config)
+    }
+
+    async fn post_json<T: serde::Serialize>(
+        &self,
+        payload: &T,
+        auth: String,
+        context: &ProviderExecutionContext,
+    ) -> Result<reqwest::Response, ProxyError> {
+        let endpoint_url = self.resolve_endpoint_url(context)?;
+        self.client
+            .post(endpoint_url)
+            .header("Authorization", auth)
+            .json(payload)
+            .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
+            .send()
+            .await
+            .map_err(ProxyError::Http)
+    }
+
     async fn execute_request(
         &self,
         req: &ChatRequest,
@@ -42,15 +71,8 @@ impl ZAIProvider {
         context: &ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
         let auth = resolve_zai_auth(headers, context)?;
-        let zai_req = to_zai_chat_request(req, context.upstream_model());
-        let resp = self
-            .client
-            .post(&CONFIG.providers.zai.api_url)
-            .header("Authorization", auth)
-            .json(&zai_req)
-            .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
-            .send()
-            .await?;
+        let zai_req = to_zai_chat_request(req, context.upstream_model(), context.reasoning());
+        let resp = self.post_json(&zai_req, auth, context).await?;
         let status = resp.status();
         info!("Z.AI response status: {}", status);
 
@@ -176,17 +198,11 @@ impl ZAIProvider {
             temperature: Some(CONFIG.compaction.temperature),
             top_p: None,
             max_tokens: Some(4096),
+            thinking: context.reasoning().map(zai_thinking_config),
         };
 
         let auth = resolve_zai_auth(headers, context)?;
-        let resp = self
-            .client
-            .post(&CONFIG.providers.zai.api_url)
-            .header("Authorization", auth)
-            .json(&payload)
-            .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
-            .send()
-            .await?;
+        let resp = self.post_json(&payload, auth, context).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -242,6 +258,51 @@ impl Provider for ZAIProvider {
         Box::pin(async move { self.handle_compact_impl(&data, headers, &context).await })
     }
 
+    fn probe_account(
+        &self,
+        context: ProviderExecutionContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let auth = resolve_zai_auth(HeaderMap::new(), &context)?;
+            let payload = ZaiChatRequest {
+                model: context.upstream_model().to_string(),
+                messages: vec![ZaiMessage {
+                    role: "user".into(),
+                    content: Some("health check".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                }],
+                stream: false,
+                tools: None,
+                tool_choice: None,
+                temperature: None,
+                top_p: None,
+                max_tokens: Some(1),
+                thinking: None,
+            };
+            let response = self.post_json(&payload, auth, &context).await?;
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(ProxyError::Auth(format!(
+                    "Z.AI recovery probe unauthorized ({}). Body: {}",
+                    status, body
+                )));
+            }
+            if !status.is_success() {
+                return Err(ProxyError::Provider(format!(
+                    "Z.AI recovery probe failed ({}): {}",
+                    status, body
+                )));
+            }
+            Ok(())
+        })
+    }
+
     fn clone_box(&self) -> Box<dyn Provider + Send + Sync> {
         Box::new(ZAIProvider {
             client: self.client.clone(),
@@ -269,6 +330,8 @@ struct ZaiChatRequest {
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ZaiThinkingConfig>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -282,6 +345,12 @@ struct ZaiMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ZaiThinkingConfig {
+    #[serde(rename = "type")]
+    thinking_type: String,
 }
 
 fn resolve_zai_auth(
@@ -306,7 +375,11 @@ fn resolve_zai_auth(
     }
 }
 
-fn to_zai_chat_request(req: &ChatRequest, model: &str) -> ZaiChatRequest {
+fn to_zai_chat_request(
+    req: &ChatRequest,
+    model: &str,
+    reasoning: Option<&EffectiveReasoningConfig>,
+) -> ZaiChatRequest {
     let tools = if req.tools.is_empty() {
         None
     } else {
@@ -321,6 +394,17 @@ fn to_zai_chat_request(req: &ChatRequest, model: &str) -> ZaiChatRequest {
         temperature: req.temperature,
         top_p: req.top_p,
         max_tokens: req.max_tokens,
+        thinking: reasoning.map(zai_thinking_config),
+    }
+}
+
+fn zai_thinking_config(reasoning: &EffectiveReasoningConfig) -> ZaiThinkingConfig {
+    ZaiThinkingConfig {
+        thinking_type: if reasoning.budget == 0 {
+            "disabled".into()
+        } else {
+            "enabled".into()
+        },
     }
 }
 
@@ -563,4 +647,31 @@ fn now_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_reasoning_budget_to_zai_thinking_toggle() {
+        assert_eq!(
+            zai_thinking_config(&EffectiveReasoningConfig {
+                budget: 0,
+                level: "LOW".into(),
+                preset: Some("none".into()),
+            })
+            .thinking_type,
+            "disabled"
+        );
+        assert_eq!(
+            zai_thinking_config(&EffectiveReasoningConfig {
+                budget: 1024,
+                level: "LOW".into(),
+                preset: Some("minimal".into()),
+            })
+            .thinking_type,
+            "enabled"
+        );
+    }
 }

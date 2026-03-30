@@ -1,31 +1,58 @@
-use super::pool::{AccountPool, AccountProvider};
+use super::pool::AccountPool;
+use crate::config::{EffectiveReasoningConfig, RouteTargetConfig};
 use crate::error::ProxyError;
 use crate::schema::openai::{ChatContent, ChatMessage};
 use parking_lot::RwLock;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use tracing::debug;
+
+#[derive(Debug, Clone)]
+pub struct RouteCandidate {
+    pub requested_model: String,
+    pub logical_model: String,
+    pub provider: crate::account_pool::AccountProvider,
+    pub upstream_model: String,
+    pub endpoint: Option<String>,
+    pub reasoning: Option<EffectiveReasoningConfig>,
+    pub priority_index: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct RoutingDecision {
     pub account_index: usize,
     pub cache_hit: bool,
     pub cache_key: u64,
+    pub preferred_target_index: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRoute {
     pub requested_model: String,
+    pub logical_model: String,
     pub upstream_model: String,
-    pub provider: AccountProvider,
+    pub endpoint: Option<String>,
+    pub provider: crate::account_pool::AccountProvider,
     pub account_index: usize,
     pub account_id: String,
     pub cache_hit: bool,
     pub cache_key: u64,
+    pub preferred_target_index: usize,
+    pub reasoning: Option<EffectiveReasoningConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StickyRouteBinding {
+    provider: crate::account_pool::AccountProvider,
+    model: String,
+    endpoint: Option<String>,
+    account_index: usize,
+    preferred_target_index: usize,
 }
 
 pub struct RoutingState {
-    sticky_bindings: RwLock<HashMap<u64, usize>>,
+    sticky_bindings: RwLock<HashMap<u64, StickyRouteBinding>>,
 }
 
 impl RoutingState {
@@ -35,10 +62,17 @@ impl RoutingState {
         }
     }
 
-    pub fn bind_on_success(&self, cache_key: u64, account_index: usize) {
-        self.sticky_bindings
-            .write()
-            .insert(cache_key, account_index);
+    pub fn bind_on_success(&self, route: &ResolvedRoute) {
+        self.sticky_bindings.write().insert(
+            route.cache_key,
+            StickyRouteBinding {
+                provider: route.provider,
+                model: route.upstream_model.clone(),
+                endpoint: route.endpoint.clone(),
+                account_index: route.account_index,
+                preferred_target_index: route.preferred_target_index,
+            },
+        );
     }
 
     pub fn snapshot_size(&self) -> usize {
@@ -86,79 +120,130 @@ fn message_signature(messages: &[ChatMessage]) -> Vec<(String, String)> {
 pub struct Router;
 
 impl Router {
+    pub fn build_candidates(
+        requested_model: &str,
+        logical_model: &str,
+        targets: &[RouteTargetConfig],
+        mut reasoning_for: impl FnMut(
+            &RouteTargetConfig,
+        ) -> Result<Option<EffectiveReasoningConfig>, ProxyError>,
+    ) -> Result<Vec<RouteCandidate>, ProxyError> {
+        targets
+            .iter()
+            .enumerate()
+            .map(|(priority_index, target)| {
+                Ok(RouteCandidate {
+                    requested_model: requested_model.to_string(),
+                    logical_model: logical_model.to_string(),
+                    provider: target.provider,
+                    upstream_model: target.model.clone(),
+                    endpoint: target.endpoint.clone(),
+                    reasoning: reasoning_for(target)?,
+                    priority_index,
+                })
+            })
+            .collect()
+    }
+
     pub fn route(
         pool: &AccountPool,
         state: &RoutingState,
-        provider: AccountProvider,
-        candidate_indices: &[usize],
+        candidates: &[RouteCandidate],
         messages: &[ChatMessage],
     ) -> Option<RoutingDecision> {
-        if candidate_indices.is_empty() {
+        if candidates.is_empty() {
             return None;
         }
 
         let cache_key = compute_cache_key(&message_signature(messages));
 
-        if let Some(&bound_idx) = state.sticky_bindings.read().get(&cache_key) {
-            if let Some((account, snapshot)) = pool.get_account(bound_idx)
-                && account.provider == provider
-                && snapshot.alive
-                && candidate_indices.contains(&bound_idx)
-            {
-                pool.increment_cache_hits(bound_idx);
-                debug!(
-                    "KV-cache hit: key={} -> account {} ({})",
-                    cache_key, account.id, account.provider
-                );
+        if let Some(binding) = state.sticky_bindings.read().get(&cache_key).cloned() {
+            for candidate in candidates {
+                if candidate.provider != binding.provider
+                    || candidate.upstream_model != binding.model
+                    || candidate.endpoint != binding.endpoint
+                    || candidate.priority_index != binding.preferred_target_index
+                {
+                    continue;
+                }
+                if let Some((account, snapshot)) = pool.get_account(binding.account_index)
+                    && account.provider == candidate.provider
+                    && account.supports_model(&candidate.upstream_model)
+                    && snapshot.alive
+                {
+                    pool.increment_cache_hits(binding.account_index);
+                    debug!(
+                        "KV-cache hit: key={} -> account {} ({}) model {}",
+                        cache_key, account.id, account.provider, candidate.upstream_model
+                    );
+                    return Some(RoutingDecision {
+                        account_index: binding.account_index,
+                        cache_hit: true,
+                        cache_key,
+                        preferred_target_index: candidate.priority_index,
+                    });
+                }
+            }
+        }
+
+        for candidate in candidates {
+            let candidate_indices =
+                pool.healthy_compatible_accounts_for_target(&RouteTargetConfig {
+                    provider: candidate.provider,
+                    model: candidate.upstream_model.clone(),
+                    endpoint: candidate.endpoint.clone(),
+                    reasoning: None,
+                });
+            if candidate_indices.is_empty() {
+                continue;
+            }
+
+            let mut sorted_indices = candidate_indices;
+            sorted_indices.sort_by_key(|idx| {
+                let (weight, failures, hits) = pool
+                    .get_account(*idx)
+                    .map(|(account, snapshot)| {
+                        (
+                            account.weight,
+                            snapshot.consecutive_failures,
+                            snapshot.cache_key_hits,
+                        )
+                    })
+                    .unwrap_or((u32::MAX, u32::MAX, u64::MAX));
+                (weight, failures, Reverse(hits), *idx)
+            });
+
+            if let Some(account_index) = sorted_indices.first().copied() {
                 return Some(RoutingDecision {
-                    account_index: bound_idx,
-                    cache_hit: true,
+                    account_index,
+                    cache_hit: false,
                     cache_key,
+                    preferred_target_index: candidate.priority_index,
                 });
             }
         }
 
-        let mut best_idx = None;
-        let mut best_score = u32::MAX;
-        let mut best_hits = u64::MAX;
-
-        for &idx in candidate_indices {
-            if let Some((_account, snapshot)) = pool.get_account(idx) {
-                if !snapshot.alive {
-                    continue;
-                }
-                if snapshot.consecutive_failures < best_score
-                    || (snapshot.consecutive_failures == best_score
-                        && snapshot.cache_key_hits < best_hits)
-                {
-                    best_score = snapshot.consecutive_failures;
-                    best_hits = snapshot.cache_key_hits;
-                    best_idx = Some(idx);
-                }
-            }
-        }
-
-        best_idx.map(|idx| RoutingDecision {
-            account_index: idx,
-            cache_hit: false,
-            cache_key,
-        })
+        None
     }
 
     pub fn resolve_route(
         pool: &AccountPool,
         state: &RoutingState,
-        requested_model: &str,
-        upstream_model: String,
-        provider: AccountProvider,
+        candidates: &[RouteCandidate],
         messages: &[ChatMessage],
     ) -> Result<ResolvedRoute, ProxyError> {
-        let candidates = pool.accounts_for_provider(provider);
-        let decision =
-            Self::route(pool, state, provider, &candidates, messages).ok_or_else(|| {
-                ProxyError::Provider(format!(
-                    "No healthy accounts available for provider {}",
-                    provider
+        let decision = Self::route(pool, state, candidates, messages).ok_or_else(|| {
+            ProxyError::Provider(
+                "No compatible healthy accounts available for any preferred target".into(),
+            )
+        })?;
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.priority_index == decision.preferred_target_index)
+            .ok_or_else(|| {
+                ProxyError::Internal(format!(
+                    "Selected preferred target index {} is missing",
+                    decision.preferred_target_index
                 ))
             })?;
         let (account, _) = pool.get_account(decision.account_index).ok_or_else(|| {
@@ -168,13 +253,118 @@ impl Router {
             ))
         })?;
         Ok(ResolvedRoute {
-            requested_model: requested_model.to_string(),
-            upstream_model,
-            provider,
+            requested_model: candidate.requested_model.clone(),
+            logical_model: candidate.logical_model.clone(),
+            upstream_model: candidate.upstream_model.clone(),
+            endpoint: candidate.endpoint.clone(),
+            provider: candidate.provider,
             account_index: decision.account_index,
             account_id: account.id,
             cache_hit: decision.cache_hit,
             cache_key: decision.cache_key,
+            preferred_target_index: decision.preferred_target_index,
+            reasoning: candidate.reasoning.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account_pool::{Account, AccountAuth, AccountProvider};
+    use crate::schema::openai::ChatMessage;
+
+    fn account(
+        id: &str,
+        provider: AccountProvider,
+        models: Option<Vec<&str>>,
+        weight: u32,
+    ) -> Account {
+        Account {
+            id: id.into(),
+            provider,
+            auth: AccountAuth::ApiKey {
+                api_key: "test-key".into(),
+            },
+            enabled: true,
+            weight,
+            models: models.map(|values| values.into_iter().map(str::to_string).collect()),
+        }
+    }
+
+    fn messages() -> Vec<ChatMessage> {
+        vec![ChatMessage {
+            role: "user".into(),
+            content: Some(ChatContent::Text("hello".into())),
+            reasoning_content: None,
+            thought_signature: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }]
+    }
+
+    fn candidate(priority_index: usize, provider: AccountProvider, model: &str) -> RouteCandidate {
+        RouteCandidate {
+            requested_model: "claude-sonnet-4-6".into(),
+            logical_model: "claude-sonnet-4-6".into(),
+            provider,
+            upstream_model: model.into(),
+            endpoint: None,
+            reasoning: None,
+            priority_index,
+        }
+    }
+
+    #[test]
+    fn prefers_first_healthy_candidate_in_order() {
+        let pool = AccountPool::new();
+        pool.load_accounts(vec![
+            account("zai", AccountProvider::Zai, Some(vec!["glm-4.6"]), 1),
+            account("openai", AccountProvider::OpenAi, Some(vec!["gpt-4.1"]), 1),
+        ]);
+        let state = RoutingState::new();
+        let route = Router::resolve_route(
+            &pool,
+            &state,
+            &[
+                candidate(0, AccountProvider::OpenAi, "gpt-4.1"),
+                candidate(1, AccountProvider::Zai, "glm-4.6"),
+            ],
+            &messages(),
+        )
+        .unwrap();
+        assert_eq!(route.provider, AccountProvider::OpenAi);
+        assert_eq!(route.upstream_model, "gpt-4.1");
+    }
+
+    #[test]
+    fn reuses_sticky_binding_when_still_healthy() {
+        let pool = AccountPool::new();
+        pool.load_accounts(vec![account(
+            "openai",
+            AccountProvider::OpenAi,
+            Some(vec!["gpt-4.1"]),
+            1,
+        )]);
+        let state = RoutingState::new();
+        let first = Router::resolve_route(
+            &pool,
+            &state,
+            &[candidate(0, AccountProvider::OpenAi, "gpt-4.1")],
+            &messages(),
+        )
+        .unwrap();
+        state.bind_on_success(&first);
+
+        let second = Router::resolve_route(
+            &pool,
+            &state,
+            &[candidate(0, AccountProvider::OpenAi, "gpt-4.1")],
+            &messages(),
+        )
+        .unwrap();
+        assert!(second.cache_hit);
+        assert_eq!(second.account_index, first.account_index);
     }
 }

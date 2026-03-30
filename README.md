@@ -5,17 +5,19 @@
 
 An OpenAI Responses API proxy for Gemini, Z.AI, and OpenAI upstreams.
 
-It accepts OpenAI-style Responses API requests, normalizes them into a shared typed internal form, resolves model/provider/account routing in one place, and then hands execution to the selected provider implementation.
+It accepts OpenAI-style Responses API requests, normalizes them into a shared typed internal form, resolves logical-model to provider/account/model routing in one place, and then hands execution to the selected provider implementation.
 
 ## Features
 
 - OpenAI-compatible `/responses` and `/responses/compact` endpoints
 - Gemini, Z.AI, and OpenAI upstream providers
 - Multi-account routing per provider
-- Shared model overrides and provider-prefix routing
-- Sticky routing for KV-cache reuse
-- Account health tracking with cooldown-based recovery
-- Structured v2 config schema with legacy flat-config startup migration
+- Ordered preferred route targets per logical model
+- Provider catalogs plus account-level optional model restrictions
+- Sticky routing for KV-cache reuse on the exact resolved provider/model/account path
+- Account health tracking with exponential backoff and recovery probes
+- Route-scoped reasoning defaults shared across providers
+- Structured config schema for providers, accounts, routing, reasoning, and compaction
 
 ## Quick start
 
@@ -32,7 +34,7 @@ cargo run --release
 Example `~/.codex/config.toml`:
 
 ```toml
-model = "gpt-4.1"
+model = "claude-sonnet-4-6"
 model_provider = "codex-proxy"
 personality = "pragmatic"
 service_tier = "fast"
@@ -49,7 +51,7 @@ requires_openai_auth = false
 
 Configuration lives at `~/.config/codex-proxy/config.json`.
 
-The runtime config schema is structured around:
+Top-level sections:
 
 - `server`
 - `providers`
@@ -60,9 +62,7 @@ The runtime config schema is structured around:
 - `timeouts`
 - `compaction`
 
-Legacy flat config is still accepted only at startup migration time. The process logs a warning and converts it into the internal v2 shape.
-
-### Example v2 config
+### Example config
 
 ```json
 {
@@ -77,36 +77,49 @@ Legacy flat config is still accepted only at startup migration time. The process
       "api_internal": "https://cloudcode-pa.googleapis.com",
       "api_public": "https://generativelanguage.googleapis.com",
       "default_client_id": "...",
-      "default_client_secret": "..."
+      "default_client_secret": "...",
+      "models": ["gemini-2.5-pro", "gemini-2.5-flash"]
     },
     "zai": {
       "api_url": "https://api.z.ai/api/coding/paas/v4/chat/completions",
-      "allow_authorization_passthrough": false
+      "allow_authorization_passthrough": false,
+      "models": ["glm-4.6"]
     },
     "openai": {
-      "responses_url": "https://api.openai.com/v1/responses"
+      "responses_url": "https://api.openai.com/v1/responses",
+      "models": ["gpt-4.1", "gpt-4.1-mini"]
     }
   },
   "models": {
-    "served": ["gpt-4.1", "gemini-2.5-pro", "glm-4.6"],
-    "compaction_model": "gpt-4.1-mini",
+    "served": ["claude-sonnet-4-6", "claude-fast", "compact-default"],
     "fallback_models": {
-      "gpt-5": "gpt-4.1",
-      "gemini-3-pro-preview": "gemini-2.5-pro"
+      "claude-fast": "claude-sonnet-4-6"
     }
   },
   "routing": {
     "model_overrides": {
-      "claude-sonnet-4-6": "gpt-4.1",
-      "gemini-fast": "gemini-2.5-flash",
-      "glm-fast": "glm-4.6"
+      "claude-fast": "claude-sonnet-4-6"
     },
-    "provider_prefixes": {
-      "gpt": "open_ai",
-      "o": "open_ai",
-      "gemini": "gemini",
-      "glm": "zai",
-      "zai": "zai"
+    "preferred_models": {
+      "claude-sonnet-4-6": [
+        {
+          "provider": "open_ai",
+          "model": "gpt-4.1",
+          "reasoning": { "effort": "medium" }
+        },
+        {
+          "provider": "gemini",
+          "model": "gemini-2.5-pro",
+          "reasoning": { "effort": "high" }
+        }
+      ],
+      "compact-default": [
+        {
+          "provider": "open_ai",
+          "model": "gpt-4.1-mini",
+          "reasoning": { "effort": "none" }
+        }
+      ]
     },
     "sticky_routing": {
       "enabled": true
@@ -114,7 +127,7 @@ Legacy flat config is still accepted only at startup migration time. The process
     "health": {
       "auth_failure_immediate_unhealthy": true,
       "failure_threshold": 3,
-      "cooldown_seconds": 300
+      "cooldown_seconds": 60
     }
   },
   "accounts": [
@@ -123,6 +136,7 @@ Legacy flat config is still accepted only at startup migration time. The process
       "provider": "open_ai",
       "enabled": true,
       "weight": 1,
+      "models": ["gpt-4.1", "gpt-4.1-mini"],
       "auth": {
         "type": "api_key",
         "api_key": "sk-..."
@@ -132,27 +146,19 @@ Legacy flat config is still accepted only at startup migration time. The process
       "id": "gemini-oauth-a",
       "provider": "gemini",
       "enabled": true,
-      "weight": 1,
+      "weight": 2,
       "auth": {
         "type": "gemini_oauth",
         "creds_path": "/Users/you/.gemini/oauth_creds.json"
-      }
-    },
-    {
-      "id": "zai-primary",
-      "provider": "zai",
-      "enabled": true,
-      "weight": 1,
-      "auth": {
-        "type": "api_key",
-        "api_key": "..."
       }
     }
   ],
   "reasoning": {
     "default_effort": "medium",
     "effort_levels": {
-      "medium": { "budget": 16384, "level": "MEDIUM" }
+      "none": { "budget": 0, "level": "LOW" },
+      "medium": { "budget": 16384, "level": "MEDIUM" },
+      "high": { "budget": 32768, "level": "HIGH" }
     }
   },
   "timeouts": {
@@ -160,28 +166,62 @@ Legacy flat config is still accepted only at startup migration time. The process
     "read_seconds": 600
   },
   "compaction": {
-    "temperature": 0.1
+    "temperature": 0.1,
+    "preferred_targets": [
+      {
+        "provider": "open_ai",
+        "model": "gpt-4.1-mini",
+        "reasoning": { "effort": "none" }
+      },
+      {
+        "provider": "gemini",
+        "model": "gemini-2.5-flash",
+        "reasoning": { "effort": "minimal" }
+      }
+    ]
   }
 }
 ```
+
+### Routing model
+
+- `routing.preferred_models[logical_model]` is an ordered list of route targets.
+- Each route target picks one upstream provider and one upstream model.
+- Sticky routing reuses the exact chosen `(provider, model, account)` path when it is still healthy.
+- If the sticky-bound path is unhealthy, routing falls through to the next compatible preferred target.
+- `accounts[].models`, when omitted, means the account can use any model from that provider's catalog.
+- `accounts[].weight` is used as a stable tiebreaker between otherwise equivalent compatible accounts.
+- Accounts are marked unhealthy on the first failure, back off exponentially, and only return after a recovery-probe path succeeds.
+
+### Reasoning model
+
+- Reusable reasoning presets live in `reasoning.effort_levels`.
+- `reasoning.default_effort` is optional and acts as the fallback when a route target does not specify one.
+- A route target can reference a preset with `reasoning.effort` or provide inline `budget` / `level` overrides.
+- Gemini applies the selected route reasoning from execution context.
+- OpenAI route reasoning is forwarded as Responses API `reasoning.effort`.
+- Z.AI route reasoning is forwarded as `thinking.type` (`enabled` / `disabled`).
 
 ### Notes
 
 - `accounts[]` is the source of truth for upstream credentials.
 - Gemini supports either `api_key` or `gemini_oauth` account auth.
 - Z.AI and OpenAI currently use straightforward account-scoped API-key auth.
-- `routing.model_overrides` runs before provider resolution.
-- Compaction uses the same shared routing path as normal responses.
+- `routing.model_overrides` maps user-facing requested models to logical routing entries.
+- Compaction uses the same ordered route planning path as normal responses, but with `compaction.preferred_targets`.
 - The OpenAI provider intentionally forwards requests upstream with minimal transformation: it swaps in the resolved upstream model and configured account auth, then forwards the OpenAI-shaped payload.
 
 ## UI
 
 Open `http://127.0.0.1:8765/config` to inspect:
 
-- structured config snapshot
+- provider URLs and model catalogs
+- ordered preferred routing policy
+- compaction targets
 - masked account auth data
-- account health
+- account health and recovery-probe state
 - sticky routing stats
+- reasoning presets
 
 ## Development
 

@@ -36,7 +36,7 @@
   header h1 { margin: 0; font-size: 18px; }
   header .meta { color: var(--muted); font-size: 13px; }
   main {
-    max-width: 1100px;
+    max-width: 1200px;
     margin: 0 auto;
     padding: 24px;
     display: grid;
@@ -44,7 +44,7 @@
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
     gap: 20px;
   }
   .card {
@@ -101,6 +101,7 @@
   }
   .ok { background: rgba(61, 220, 151, 0.14); color: var(--success); }
   .bad { background: rgba(255, 107, 107, 0.14); color: var(--error); }
+  .warn { background: rgba(245, 166, 35, 0.14); color: var(--warn); }
   .small { color: var(--muted); font-size: 12px; }
 </style>
 </head>
@@ -108,7 +109,7 @@
 <header>
   <div>
     <h1>codex-proxy</h1>
-    <div class="meta">Structured config, account health, and routing snapshot</div>
+    <div class="meta">Capability routing, account health, and sticky routing snapshot</div>
   </div>
   <div id="summary" class="meta"></div>
 </header>
@@ -132,6 +133,8 @@
           <tr>
             <th>ID</th>
             <th>Provider</th>
+            <th>Allowed models</th>
+            <th>Weight</th>
             <th>Auth</th>
             <th>Health</th>
             <th>Failures</th>
@@ -194,23 +197,26 @@ async function load() {
 
   setDl('models', [
     ['served', data.models.served.length ? data.models.served.join(', ') : '(any)'],
-    ['compaction', data.models.compaction_model || ''],
     ['fallbacks', Object.keys(data.models.fallback_models).length ? Object.keys(data.models.fallback_models).length : '0'],
+    ['compaction targets', data.compaction.preferred_targets.length],
   ]);
 
   document.getElementById('accounts').innerHTML = data.accounts.map((account) => {
     const auth = account.auth.api_key_masked || account.auth.creds_path || account.auth.auth_type;
     const health = account.alive
       ? '<span class="pill ok">healthy</span>'
-      : '<span class="pill bad">unhealthy</span>';
+      : (account.recovery_probe_due ? '<span class="pill warn">probe due</span>' : '<span class="pill bad">unhealthy</span>');
+    const allowedModels = account.models && account.models.length ? account.models.join(', ') : '(provider catalog)';
     return `<tr>
       <td>${account.id}</td>
       <td>${account.provider}</td>
+      <td>${allowedModels}</td>
+      <td>${account.weight}</td>
       <td>${auth}</td>
       <td>${health}</td>
       <td>${account.consecutive_failures}</td>
       <td>${account.cache_key_hits}</td>
-      <td><div>${ts(account.unhealthy_until)}</div><div class="small">last failure: ${ts(account.last_failure_at)}</div></td>
+      <td><div>${ts(account.unhealthy_until)}</div><div class="small">probe due: ${String(account.recovery_probe_due)} · last failure: ${ts(account.last_failure_at)}</div></td>
     </tr>`;
   }).join('');
 

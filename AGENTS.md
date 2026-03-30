@@ -55,7 +55,7 @@ Gemini auth is account-scoped via `src/auth/mod.rs`.
 
 ## Configuration
 
-Configuration now uses a structured v2 schema centered on:
+Configuration uses a structured schema centered on:
 
 - `server`
 - `providers`
@@ -72,7 +72,7 @@ Key behaviors:
 - `routing.model_overrides` rewrites requested models before provider resolution.
 - `routing.provider_prefixes` maps model prefixes to providers.
 - `models.compaction_model` routes compaction through the same shared routing path.
-- legacy flat config is only supported at startup migration time and is converted into the v2 internal config.
+- the config file has a single current format.
 
 ## UI and config endpoint
 
@@ -107,8 +107,7 @@ cargo test
 
 When touching routing/auth/config logic, also sanity check:
 
-- v2 config boot path
-- legacy flat config migration path
+- config boot path
 - provider override routing
 - multi-account isolation
 - sticky-routing failover behavior

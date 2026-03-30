@@ -1,4 +1,5 @@
 use crate::account_pool::{Account, AccountProvider, ResolvedRoute};
+use crate::config::EffectiveReasoningConfig;
 use crate::error::ProxyError;
 use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
 use axum::body::Body;
@@ -18,6 +19,18 @@ impl ProviderExecutionContext {
 
     pub fn upstream_model(&self) -> &str {
         &self.route.upstream_model
+    }
+
+    pub fn reasoning(&self) -> Option<&EffectiveReasoningConfig> {
+        self.route.reasoning.as_ref()
+    }
+
+    pub fn preferred_target_index(&self) -> usize {
+        self.route.preferred_target_index
+    }
+
+    pub fn endpoint_name(&self) -> Option<&str> {
+        self.route.endpoint.as_deref()
     }
 }
 
@@ -44,6 +57,19 @@ pub trait Provider: Send + Sync {
             let _ = (data, headers, context);
             Err(ProxyError::Provider(
                 "Compaction not implemented for this provider".into(),
+            ))
+        })
+    }
+
+    fn probe_account(
+        &self,
+        context: ProviderExecutionContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let _ = context;
+            Err(ProxyError::Provider(
+                "Recovery probe not implemented for this provider".into(),
             ))
         })
     }

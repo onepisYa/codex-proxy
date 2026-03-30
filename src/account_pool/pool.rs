@@ -1,11 +1,10 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use crate::config::{AccountConfig, RoutingHealthConfig};
+use crate::config::{AccountConfig, RouteTargetConfig, RoutingHealthConfig};
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -69,6 +68,17 @@ pub struct Account {
     pub enabled: bool,
     #[serde(default, skip_serializing)]
     pub weight: u32,
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
+}
+
+impl Account {
+    pub fn supports_model(&self, model: &str) -> bool {
+        match &self.models {
+            Some(models) => models.iter().any(|allowed| allowed == model),
+            None => true,
+        }
+    }
 }
 
 impl From<AccountConfig> for Account {
@@ -79,6 +89,7 @@ impl From<AccountConfig> for Account {
             auth: value.auth,
             enabled: value.enabled,
             weight: value.weight,
+            models: value.models,
         }
     }
 }
@@ -89,6 +100,8 @@ struct AccountState {
     cache_key_hits: AtomicU64,
     last_failure_at: Option<SystemTime>,
     unhealthy_until: Option<SystemTime>,
+    recovery_probe_due: bool,
+    probe_in_progress: AtomicBool,
 }
 
 impl AccountState {
@@ -99,13 +112,14 @@ impl AccountState {
             cache_key_hits: AtomicU64::new(0),
             last_failure_at: None,
             unhealthy_until: None,
+            recovery_probe_due: false,
+            probe_in_progress: AtomicBool::new(false),
         }
     }
 }
 
 pub struct AccountPool {
     accounts: RwLock<Vec<(Account, RwLock<AccountState>)>>,
-    model_overrides: RwLock<HashMap<String, String>>,
     health: RwLock<RoutingHealthConfig>,
 }
 
@@ -113,7 +127,6 @@ impl AccountPool {
     pub fn new() -> Self {
         Self {
             accounts: RwLock::new(Vec::new()),
-            model_overrides: RwLock::new(HashMap::new()),
             health: RwLock::new(RoutingHealthConfig::default()),
         }
     }
@@ -143,6 +156,10 @@ impl AccountPool {
                             ),
                             last_failure_at: snapshot.last_failure_at,
                             unhealthy_until: snapshot.unhealthy_until,
+                            recovery_probe_due: snapshot.recovery_probe_due,
+                            probe_in_progress: AtomicBool::new(
+                                snapshot.probe_in_progress.load(Ordering::Relaxed),
+                            ),
                         })
                     })
                     .unwrap_or_else(|| RwLock::new(AccountState::new()));
@@ -156,53 +173,86 @@ impl AccountPool {
         );
     }
 
-    pub fn load_model_overrides(&self, overrides: HashMap<String, String>) {
-        *self.model_overrides.write() = overrides;
+    pub fn healthy_compatible_accounts_for_target(&self, target: &RouteTargetConfig) -> Vec<usize> {
+        let guard = self.accounts.read();
+        guard
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (account, _))| {
+                (account.provider == target.provider
+                    && account.supports_model(&target.model)
+                    && self.get_account(i).map(|(_, s)| s.alive).unwrap_or(false))
+                .then_some(i)
+            })
+            .collect()
     }
 
-    pub fn resolve_model(&self, model: &str) -> String {
-        self.model_overrides
-            .read()
-            .get(model)
-            .cloned()
-            .unwrap_or_else(|| model.to_string())
-    }
-
-    pub fn accounts_for_provider(&self, provider: AccountProvider) -> Vec<usize> {
+    pub fn recovery_candidates(&self) -> Vec<usize> {
         let guard = self.accounts.read();
         let now = SystemTime::now();
         guard
             .iter()
             .enumerate()
-            .filter_map(|(i, (account, state))| {
-                if account.provider != provider {
-                    return None;
-                }
-                let mut state = state.write();
-                if let Some(until) = state.unhealthy_until
-                    && until <= now
-                {
-                    state.alive = true;
-                    state.unhealthy_until = None;
-                    state.consecutive_failures = 0;
-                }
-                Some(i)
+            .filter_map(|(i, (_, state))| {
+                let state = state.read();
+                let due = state.recovery_probe_due
+                    && state
+                        .unhealthy_until
+                        .map(|until| until <= now)
+                        .unwrap_or(false)
+                    && !state.probe_in_progress.load(Ordering::Relaxed);
+                due.then_some(i)
             })
             .collect()
+    }
+
+    pub fn begin_recovery_probe(&self, index: usize) -> bool {
+        let guard = self.accounts.read();
+        let Some((_, state)) = guard.get(index) else {
+            return false;
+        };
+        let state = state.read();
+        !state.probe_in_progress.swap(true, Ordering::AcqRel)
+    }
+
+    pub fn finish_recovery_probe(&self, index: usize, success: bool) {
+        let guard = self.accounts.read();
+        if let Some((account, state)) = guard.get(index) {
+            let mut state = state.write();
+            state.probe_in_progress.store(false, Ordering::Release);
+            if success {
+                state.alive = true;
+                state.consecutive_failures = 0;
+                state.unhealthy_until = None;
+                state.recovery_probe_due = false;
+                info!(
+                    "Recovery probe succeeded for account {} ({})",
+                    account.id, account.provider
+                );
+            } else {
+                let health = self.health.read().clone();
+                let now = SystemTime::now();
+                state.consecutive_failures += 1;
+                let backoff_factor = state
+                    .consecutive_failures
+                    .saturating_sub(1)
+                    .min(health.failure_threshold.saturating_sub(1));
+                let cooldown_multiplier = 1u64 << backoff_factor;
+                let cooldown_seconds = health.cooldown_seconds.saturating_mul(cooldown_multiplier);
+                state.unhealthy_until = Some(now + Duration::from_secs(cooldown_seconds));
+                state.recovery_probe_due = true;
+                warn!(
+                    "Recovery probe failed for account {} ({}) next backoff={}s failures={}",
+                    account.id, account.provider, cooldown_seconds, state.consecutive_failures
+                );
+            }
+        }
     }
 
     pub fn get_account(&self, index: usize) -> Option<(Account, AccountSnapshot)> {
         let guard = self.accounts.read();
         guard.get(index).map(|(account, state)| {
-            let mut state = state.write();
-            let now = SystemTime::now();
-            if let Some(until) = state.unhealthy_until
-                && until <= now
-            {
-                state.alive = true;
-                state.unhealthy_until = None;
-                state.consecutive_failures = 0;
-            }
+            let state = state.read();
             (
                 account.clone(),
                 AccountSnapshot {
@@ -211,6 +261,8 @@ impl AccountPool {
                     cache_key_hits: state.cache_key_hits.load(Ordering::Relaxed),
                     last_failure_at: state.last_failure_at,
                     unhealthy_until: state.unhealthy_until,
+                    recovery_probe_due: state.recovery_probe_due,
+                    probe_in_progress: state.probe_in_progress.load(Ordering::Relaxed),
                 },
             )
         })
@@ -223,6 +275,8 @@ impl AccountPool {
             state.alive = true;
             state.consecutive_failures = 0;
             state.unhealthy_until = None;
+            state.recovery_probe_due = false;
+            state.probe_in_progress.store(false, Ordering::Release);
             debug!(
                 "Account {} ({}) marked healthy",
                 account.id, account.provider
@@ -238,14 +292,28 @@ impl AccountPool {
             let now = SystemTime::now();
             state.last_failure_at = Some(now);
             state.consecutive_failures += 1;
+
+            let backoff_factor = state
+                .consecutive_failures
+                .saturating_sub(1)
+                .min(health.failure_threshold.saturating_sub(1));
+            let cooldown_multiplier = 1u64 << backoff_factor;
+            let cooldown_seconds = health.cooldown_seconds.saturating_mul(cooldown_multiplier);
+
             let should_mark_unhealthy = (is_auth_error && health.auth_failure_immediate_unhealthy)
-                || state.consecutive_failures >= health.failure_threshold;
+                || state.consecutive_failures >= 1;
             if should_mark_unhealthy {
                 state.alive = false;
-                state.unhealthy_until = Some(now + Duration::from_secs(health.cooldown_seconds));
+                state.recovery_probe_due = true;
+                state.unhealthy_until = Some(now + Duration::from_secs(cooldown_seconds));
+                state.probe_in_progress.store(false, Ordering::Release);
                 warn!(
-                    "Account {} ({}) marked unhealthy (failures={}, auth_error={})",
-                    account.id, account.provider, state.consecutive_failures, is_auth_error
+                    "Account {} ({}) marked unhealthy (failures={}, auth_error={}, backoff={}s)",
+                    account.id,
+                    account.provider,
+                    state.consecutive_failures,
+                    is_auth_error,
+                    cooldown_seconds
                 );
             }
         }
@@ -267,19 +335,19 @@ impl AccountPool {
                 AccountStatus {
                     id: account.id.clone(),
                     provider: account.provider,
+                    models: account.models.clone(),
+                    weight: account.weight,
                     auth: mask_auth(&account.auth),
                     alive: state.alive,
                     consecutive_failures: state.consecutive_failures,
                     cache_key_hits: state.cache_key_hits.load(Ordering::Relaxed),
                     last_failure_at: state.last_failure_at,
                     unhealthy_until: state.unhealthy_until,
+                    recovery_probe_due: state.recovery_probe_due,
+                    probe_in_progress: state.probe_in_progress.load(Ordering::Relaxed),
                 }
             })
             .collect()
-    }
-
-    pub fn model_overrides_snapshot(&self) -> HashMap<String, String> {
-        self.model_overrides.read().clone()
     }
 
     pub fn account_count(&self) -> usize {
@@ -293,6 +361,8 @@ pub struct AccountSnapshot {
     pub cache_key_hits: u64,
     pub last_failure_at: Option<SystemTime>,
     pub unhealthy_until: Option<SystemTime>,
+    pub recovery_probe_due: bool,
+    pub probe_in_progress: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -312,12 +382,16 @@ pub struct MaskedAccountAuth {
 pub struct AccountStatus {
     pub id: String,
     pub provider: AccountProvider,
+    pub models: Option<Vec<String>>,
+    pub weight: u32,
     pub auth: MaskedAccountAuth,
     pub alive: bool,
     pub consecutive_failures: u32,
     pub cache_key_hits: u64,
     pub last_failure_at: Option<SystemTime>,
     pub unhealthy_until: Option<SystemTime>,
+    pub recovery_probe_due: bool,
+    pub probe_in_progress: bool,
 }
 
 fn mask_auth(auth: &AccountAuth) -> MaskedAccountAuth {
@@ -348,4 +422,60 @@ fn mask_key(key: &str) -> String {
         return "***".into();
     }
     format!("{}...{}", &key[..4], &key[key.len() - 4..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(
+        id: &str,
+        provider: AccountProvider,
+        models: Option<Vec<&str>>,
+        weight: u32,
+    ) -> Account {
+        Account {
+            id: id.into(),
+            provider,
+            auth: AccountAuth::ApiKey {
+                api_key: "test-key".into(),
+            },
+            enabled: true,
+            weight,
+            models: models.map(|values| values.into_iter().map(str::to_string).collect()),
+        }
+    }
+
+    fn target(provider: AccountProvider, model: &str) -> RouteTargetConfig {
+        RouteTargetConfig {
+            provider,
+            model: model.into(),
+            endpoint: None,
+            reasoning: None,
+        }
+    }
+
+    #[test]
+    fn filters_accounts_by_model_capability() {
+        let pool = AccountPool::new();
+        pool.load_accounts(vec![
+            account("a", AccountProvider::OpenAi, Some(vec!["gpt-4.1"]), 1),
+            account("b", AccountProvider::OpenAi, Some(vec!["gpt-4.1-mini"]), 1),
+        ]);
+
+        let compatible = pool
+            .healthy_compatible_accounts_for_target(&target(AccountProvider::OpenAi, "gpt-4.1"));
+        assert_eq!(compatible, vec![0]);
+    }
+
+    #[test]
+    fn marks_account_unhealthy_on_first_failure() {
+        let pool = AccountPool::new();
+        pool.load_accounts(vec![account("a", AccountProvider::OpenAi, None, 1)]);
+        pool.mark_failure(0, false);
+        let (_, snapshot) = pool.get_account(0).unwrap();
+        assert!(!snapshot.alive);
+        assert!(snapshot.recovery_probe_due);
+        assert!(snapshot.unhealthy_until.is_some());
+    }
 }

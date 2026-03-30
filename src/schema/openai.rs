@@ -163,7 +163,7 @@ pub struct Tool {
     #[serde(default)]
     pub function: Option<FunctionDef>,
 
-    // Flat function schema (legacy / non-wrapped)
+    // Flat function schema (non-wrapped)
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]

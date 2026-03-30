@@ -46,8 +46,7 @@ impl GeminiProvider {
         let temperature = req_data.temperature.unwrap_or(1.0);
         let top_p = req_data.top_p.unwrap_or(1.0);
         let max_tokens = req_data.max_tokens;
-        let reasoning_effort = &CONFIG.reasoning.default_effort;
-        let reasoning_cfg = CONFIG.reasoning.effort_levels.get(reasoning_effort);
+        let reasoning_cfg = context.reasoning();
 
         let mut gen_config = GeminiGenerationConfig {
             temperature,
@@ -224,7 +223,12 @@ impl GeminiProvider {
                 temperature: CONFIG.compaction.temperature,
                 top_p: 1.0,
                 max_output_tokens: Some(4096),
-                thinking_config: None,
+                thinking_config: context.reasoning().and_then(|rc| {
+                    (rc.budget > 0).then_some(GeminiThinkingConfig {
+                        thinking_budget: rc.budget,
+                        include_thoughts: true,
+                    })
+                }),
             },
             system_instruction,
             tools: None,
@@ -349,6 +353,40 @@ impl Provider for GeminiProvider {
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
         Box::pin(async move { self.handle_compact_impl(&data, &context).await })
+    }
+
+    fn probe_account(
+        &self,
+        context: ProviderExecutionContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let request = ChatRequest {
+                model: context.upstream_model().to_string(),
+                messages: vec![crate::schema::openai::ChatMessage {
+                    role: "user".into(),
+                    content: Some(crate::schema::openai::ChatContent::Text(
+                        "health check".into(),
+                    )),
+                    reasoning_content: None,
+                    thought_signature: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                }],
+                tools: Vec::new(),
+                tool_choice: None,
+                temperature: None,
+                top_p: None,
+                max_tokens: Some(1),
+                stream: false,
+                store: false,
+                metadata: Default::default(),
+                previous_response_id: None,
+                include: Vec::new(),
+            };
+            self.execute_stream(&request, &context).await.map(|_| ())
+        })
     }
 
     fn clone_box(&self) -> Box<dyn Provider + Send + Sync> {

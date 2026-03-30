@@ -5,4 +5,4 @@ pub use pool::{
     Account, AccountAuth, AccountPool, AccountProvider, AccountSnapshot, AccountStatus,
     MaskedAccountAuth,
 };
-pub use routing::{ResolvedRoute, Router, RoutingDecision, RoutingState};
+pub use routing::{ResolvedRoute, RouteCandidate, Router, RoutingDecision, RoutingState};
