@@ -4,7 +4,7 @@ use axum::response::Response;
 use serde_json::{Value, json};
 
 use crate::account_pool::AccountAuth;
-use crate::config::{CONFIG, EffectiveReasoningConfig};
+use crate::config::{EffectiveReasoningConfig, with_config};
 use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
@@ -30,9 +30,10 @@ impl OpenAiProvider {
         &self,
         context: &ProviderExecutionContext,
     ) -> Result<String, ProxyError> {
-        CONFIG
-            .endpoint_url(context.provider(), context.endpoint_name())
-            .map_err(ProxyError::Config)
+        with_config(&context.config, |cfg| {
+            cfg.endpoint_url(context.provider(), context.endpoint_name())
+        })
+        .map_err(ProxyError::Config)
     }
 
     async fn send_json(
@@ -65,7 +66,10 @@ impl OpenAiProvider {
             .post(endpoint_url)
             .headers(headers)
             .json(&payload)
-            .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
+            .timeout(std::time::Duration::from_secs(with_config(
+                &context.config,
+                |cfg| cfg.timeouts.read_seconds,
+            )))
             .send()
             .await
             .map_err(ProxyError::Http)
@@ -140,7 +144,7 @@ impl Provider for OpenAiProvider {
             "input": data.input,
             "instructions": data.instructions,
             "store": false,
-            "temperature": CONFIG.compaction.temperature,
+            "temperature": with_config(&context.config, |cfg| cfg.compaction.temperature),
             "max_tokens": 4096,
             "stream": false
         });
@@ -238,11 +242,62 @@ fn budget_to_effort(budget: u64) -> &'static str {
 mod tests {
     use super::*;
     use crate::account_pool::{Account, AccountAuth, ResolvedRoute};
+    use crate::config::{
+        AccessControlConfig, CompactionConfig, ModelsConfig, ProviderConfig, ProvidersConfig,
+        ReasoningConfig, RoutingConfig, RoutingHealthConfig, ServerConfig, StickyRoutingConfig,
+        TimeoutsConfig,
+    };
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn context(
         reasoning: Option<EffectiveReasoningConfig>,
         endpoint: Option<&str>,
     ) -> ProviderExecutionContext {
+        let providers: ProvidersConfig = HashMap::from([(
+            "openai".into(),
+            ProviderConfig::OpenAi {
+                api_url: "https://example.com/v1/responses".into(),
+                endpoints: HashMap::new(),
+                models: Vec::new(),
+            },
+        )]);
+        let cfg = crate::config::Config {
+            config_path: PathBuf::from("/tmp/test-config.json"),
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 8765,
+                log_level: "INFO".into(),
+                debug_mode: false,
+            },
+            providers,
+            models: ModelsConfig {
+                served: Vec::new(),
+                fallback_models: HashMap::new(),
+            },
+            routing: RoutingConfig {
+                model_overrides: HashMap::new(),
+                preferred_models: HashMap::new(),
+                sticky_routing: StickyRoutingConfig::default(),
+                health: RoutingHealthConfig::default(),
+            },
+            accounts: Vec::new(),
+            access: AccessControlConfig::default(),
+            reasoning: ReasoningConfig::default(),
+            timeouts: TimeoutsConfig {
+                connect_seconds: 10,
+                read_seconds: 30,
+            },
+            compaction: CompactionConfig {
+                temperature: 0.1,
+                preferred_targets: Vec::new(),
+            },
+        };
+        let config = Arc::new(RwLock::new(cfg));
+        let gemini_auth = Arc::new(crate::auth::GeminiAuthManager::new(config.clone()));
+
         ProviderExecutionContext {
             route: ResolvedRoute {
                 requested_model: "claude-sonnet-4-6".into(),
@@ -267,6 +322,8 @@ mod tests {
                 weight: 1,
                 models: None,
             },
+            config,
+            gemini_auth,
         }
     }
 

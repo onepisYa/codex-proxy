@@ -7,6 +7,7 @@
   },
   "providers": {
     "gemini": {
+      "type": "gemini",
       "api_internal": "https://cloudcode-pa.googleapis.com",
       "api_public": "https://generativelanguage.googleapis.com",
       "default_client_id": "",
@@ -14,15 +15,23 @@
       "models": []
     },
     "zai": {
+      "type": "zai",
       "api_url": "https://api.z.ai/api/coding/paas/v4/chat/completions",
       "endpoints": {},
       "allow_authorization_passthrough": false,
       "models": []
     },
     "openai": {
+      "type": "openai",
       "endpoints": {},
       "models": [],
       "api_url": "https://api.openai.com/v1/responses"
+    },
+    "tabcode": {
+      "type": "openai",
+      "api_url": "https://api2.tabcode.cc/openai/v1/responses",
+      "endpoints": {},
+      "models": []
     }
   },
   "models": {

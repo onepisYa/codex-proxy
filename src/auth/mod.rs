@@ -1,8 +1,7 @@
 use crate::account_pool::{Account, AccountAuth};
-use crate::config::CONFIG;
+use crate::config::{ConfigHandle, with_config};
 use crate::error::ProxyError;
 use crate::schema::json_value::JsonValue;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -10,8 +9,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
-
-pub static GEMINI_AUTH_MANAGER: Lazy<GeminiAuthManager> = Lazy::new(GeminiAuthManager::new);
 
 #[derive(Debug, Clone)]
 pub struct AuthContext {
@@ -126,12 +123,14 @@ struct TokenCache {
 }
 
 pub struct GeminiAuthManager {
+    config: ConfigHandle,
     clients: Mutex<HashMap<String, Arc<GeminiAuth>>>,
 }
 
 impl GeminiAuthManager {
-    pub fn new() -> Self {
+    pub fn new(config: ConfigHandle) -> Self {
         Self {
+            config,
             clients: Mutex::new(HashMap::new()),
         }
     }
@@ -145,7 +144,7 @@ impl GeminiAuthManager {
             let mut clients = self.clients.lock().unwrap();
             clients
                 .entry(account.id.clone())
-                .or_insert_with(|| Arc::new(GeminiAuth::new(account.clone())))
+                .or_insert_with(|| Arc::new(GeminiAuth::new(account.clone(), self.config.clone())))
                 .clone()
         };
         auth.get_auth_context(force_refresh).await
@@ -154,15 +153,17 @@ impl GeminiAuthManager {
 
 pub struct GeminiAuth {
     account: Account,
+    config: ConfigHandle,
     client: reqwest::Client,
     cache: Mutex<Option<TokenCache>>,
     project_id_cache: Mutex<Option<String>>,
 }
 
 impl GeminiAuth {
-    pub fn new(account: Account) -> Self {
+    pub fn new(account: Account, config: ConfigHandle) -> Self {
         Self {
             account,
+            config,
             client: reqwest::Client::new(),
             cache: Mutex::new(None),
             project_id_cache: Mutex::new(None),
@@ -268,9 +269,10 @@ impl GeminiAuth {
             self.account.id,
             path.display()
         );
-        let provider_cfg = CONFIG
-            .gemini_provider_config(&self.account.provider)
-            .map_err(ProxyError::Config)?;
+        let provider_cfg = with_config(&self.config, |cfg| {
+            cfg.gemini_provider_config(&self.account.provider)
+        })
+        .map_err(ProxyError::Config)?;
         let (default_client_id, default_client_secret) = match &self.account.auth {
             AccountAuth::GeminiOAuth {
                 client_id,
@@ -398,13 +400,12 @@ impl GeminiAuth {
     }
 
     async fn fetch_project_info(&self, token: &str) -> Result<LoadCodeAssistResponse, ProxyError> {
-        let url = format!(
-            "{}/v1internal:loadCodeAssist",
-            CONFIG
-                .gemini_provider_config(&self.account.provider)
-                .map_err(ProxyError::Config)?
-                .api_internal
-        );
+        let api_internal = with_config(&self.config, |cfg| {
+            cfg.gemini_provider_config(&self.account.provider)
+                .map(|p| p.api_internal)
+        })
+        .map_err(ProxyError::Config)?;
+        let url = format!("{}/v1internal:loadCodeAssist", api_internal);
         let body = LoadCodeAssistRequest {
             metadata: default_metadata(),
         };
@@ -422,13 +423,12 @@ impl GeminiAuth {
     }
 
     async fn onboard_user(&self, token: &str, tier_id: &str) -> Result<String, ProxyError> {
-        let url = format!(
-            "{}/v1internal:onboardUser",
-            CONFIG
-                .gemini_provider_config(&self.account.provider)
-                .map_err(ProxyError::Config)?
-                .api_internal
-        );
+        let api_internal = with_config(&self.config, |cfg| {
+            cfg.gemini_provider_config(&self.account.provider)
+                .map(|p| p.api_internal)
+        })
+        .map_err(ProxyError::Config)?;
+        let url = format!("{}/v1internal:onboardUser", api_internal);
         let body = OnboardUserRequest {
             tier_id,
             metadata: default_metadata(),
@@ -464,14 +464,12 @@ impl GeminiAuth {
         token: &str,
         op_name: &str,
     ) -> Result<PollOperationResponse, ProxyError> {
-        let url = format!(
-            "{}/v1internal/{}",
-            CONFIG
-                .gemini_provider_config(&self.account.provider)
-                .map_err(ProxyError::Config)?
-                .api_internal,
-            op_name
-        );
+        let api_internal = with_config(&self.config, |cfg| {
+            cfg.gemini_provider_config(&self.account.provider)
+                .map(|p| p.api_internal)
+        })
+        .map_err(ProxyError::Config)?;
+        let url = format!("{}/v1internal/{}", api_internal, op_name);
         let start = std::time::Instant::now();
         loop {
             if start.elapsed() > std::time::Duration::from_secs(60) {

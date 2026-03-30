@@ -1,236 +1,468 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>codex-proxy · Config</title>
-<style>
-  :root {
-    --bg: #0f1117;
-    --surface: #1a1d27;
-    --border: #2e3148;
-    --text: #e2e4f0;
-    --muted: #8b90aa;
-    --success: #3ddc97;
-    --warn: #f5a623;
-    --error: #ff6b6b;
-    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    --sans: Inter, system-ui, -apple-system, sans-serif;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--sans);
-  }
-  header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 16px;
-    padding: 16px 24px;
-    border-bottom: 1px solid var(--border);
-    background: var(--surface);
-  }
-  header h1 { margin: 0; font-size: 18px; }
-  header .meta { color: var(--muted); font-size: 13px; }
-  main {
-    max-width: 1200px;
-    margin: 0 auto;
-    padding: 24px;
-    display: grid;
-    gap: 20px;
-  }
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-    gap: 20px;
-  }
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    overflow: hidden;
-  }
-  .card h2 {
-    margin: 0;
-    padding: 14px 16px;
-    font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--muted);
-    border-bottom: 1px solid var(--border);
-  }
-  .section { padding: 16px; }
-  dl {
-    margin: 0;
-    display: grid;
-    grid-template-columns: 140px 1fr;
-    gap: 8px 12px;
-    font-size: 13px;
-  }
-  dt { color: var(--muted); }
-  dd { margin: 0; word-break: break-word; }
-  pre {
-    margin: 0;
-    white-space: pre-wrap;
-    word-break: break-word;
-    font: 12px/1.45 var(--mono);
-    color: var(--text);
-  }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-  th, td {
-    text-align: left;
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
-    vertical-align: top;
-  }
-  th { color: var(--muted); font-weight: 600; }
-  tr:last-child td { border-bottom: none; }
-  .pill {
-    display: inline-block;
-    border-radius: 999px;
-    padding: 3px 8px;
-    font-size: 12px;
-    font-weight: 600;
-  }
-  .ok { background: rgba(61, 220, 151, 0.14); color: var(--success); }
-  .bad { background: rgba(255, 107, 107, 0.14); color: var(--error); }
-  .warn { background: rgba(245, 166, 35, 0.14); color: var(--warn); }
-  .small { color: var(--muted); font-size: 12px; }
-</style>
-</head>
-<body>
-<header>
-  <div>
-    <h1>codex-proxy</h1>
-    <div class="meta">Capability routing, account health, and sticky routing snapshot</div>
-  </div>
-  <div id="summary" class="meta"></div>
-</header>
-<main>
-  <div class="grid">
-    <section class="card">
-      <h2>Server</h2>
-      <div class="section"><dl id="server"></dl></div>
-    </section>
-    <section class="card">
-      <h2>Models</h2>
-      <div class="section"><dl id="models"></dl></div>
-    </section>
-  </div>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>codex-proxy · Admin</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-slate-950 text-slate-100">
+    <div id="app"></div>
 
-  <section class="card">
-    <h2>Accounts</h2>
-    <div class="section">
-      <table>
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Provider</th>
-            <th>Allowed models</th>
-            <th>Weight</th>
-            <th>Auth</th>
-            <th>Health</th>
-            <th>Failures</th>
-            <th>Cache hits</th>
-            <th>Recovery</th>
-          </tr>
-        </thead>
-        <tbody id="accounts"></tbody>
-      </table>
-    </div>
-  </section>
+    <script type="module">
+      import { createEffect, createMemo, createSignal, For, Show } from "https://esm.sh/solid-js@1.8.15";
+      import { render } from "https://esm.sh/solid-js@1.8.15/web";
 
-  <div class="grid">
-    <section class="card">
-      <h2>Routing</h2>
-      <div class="section"><pre id="routing"></pre></div>
-    </section>
-    <section class="card">
-      <h2>Providers</h2>
-      <div class="section"><pre id="providers"></pre></div>
-    </section>
-  </div>
+      const STORAGE_KEY = "codex-proxy:admin_key";
 
-  <div class="grid">
-    <section class="card">
-      <h2>Reasoning</h2>
-      <div class="section"><pre id="reasoning"></pre></div>
-    </section>
-    <section class="card">
-      <h2>Timeouts / Compaction</h2>
-      <div class="section"><pre id="runtime"></pre></div>
-    </section>
-  </div>
-</main>
-<script>
-function fmt(obj) {
-  return JSON.stringify(obj, null, 2);
-}
-function ts(value) {
-  if (!value) return '—';
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
-}
-function setDl(id, entries) {
-  const el = document.getElementById(id);
-  el.innerHTML = entries.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
-}
-async function load() {
-  const res = await fetch('/config');
-  const data = await res.json();
+      function jsonPretty(value) {
+        return JSON.stringify(value, null, 2);
+      }
 
-  document.getElementById('summary').textContent = `${data.stats.account_count} accounts · ${data.stats.sticky_binding_count} sticky bindings`;
+      function maskError(err) {
+        if (!err) return "unknown error";
+        if (typeof err === "string") return err;
+        if (err.message) return err.message;
+        try { return JSON.stringify(err); } catch { return String(err); }
+      }
 
-  setDl('server', [
-    ['host', data.server.host],
-    ['port', data.server.port],
-    ['log level', data.server.log_level],
-    ['debug', String(data.server.debug_mode)],
-  ]);
+      function App() {
+        const [adminKey, setAdminKey] = createSignal(localStorage.getItem(STORAGE_KEY) || "");
+        const [tab, setTab] = createSignal("overview");
+        const [error, setError] = createSignal("");
+        const [busy, setBusy] = createSignal(false);
 
-  setDl('models', [
-    ['served', data.models.served.length ? data.models.served.join(', ') : '(any)'],
-    ['fallbacks', Object.keys(data.models.fallback_models).length ? Object.keys(data.models.fallback_models).length : '0'],
-    ['compaction targets', data.compaction.preferred_targets.length],
-  ]);
+        const headers = createMemo(() => {
+          const h = { "content-type": "application/json" };
+          const key = adminKey().trim();
+          if (key) h["x-codex-proxy-key"] = key;
+          return h;
+        });
 
-  document.getElementById('accounts').innerHTML = data.accounts.map((account) => {
-    const auth = account.auth.api_key_masked || account.auth.creds_path || account.auth.auth_type;
-    const health = account.alive
-      ? '<span class="pill ok">healthy</span>'
-      : (account.recovery_probe_due ? '<span class="pill warn">probe due</span>' : '<span class="pill bad">unhealthy</span>');
-    const allowedModels = account.models && account.models.length ? account.models.join(', ') : '(provider catalog)';
-    return `<tr>
-      <td>${account.id}</td>
-      <td>${account.provider}</td>
-      <td>${allowedModels}</td>
-      <td>${account.weight}</td>
-      <td>${auth}</td>
-      <td>${health}</td>
-      <td>${account.consecutive_failures}</td>
-      <td>${account.cache_key_hits}</td>
-      <td><div>${ts(account.unhealthy_until)}</div><div class="small">probe due: ${String(account.recovery_probe_due)} · last failure: ${ts(account.last_failure_at)}</div></td>
-    </tr>`;
-  }).join('');
+        async function apiGet(path) {
+          setError("");
+          const r = await fetch(path, { method: "GET", headers: headers() });
+          const data = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(data?.error?.message || `${r.status} ${r.statusText}`);
+          return data;
+        }
 
-  document.getElementById('routing').textContent = fmt(data.routing);
-  document.getElementById('providers').textContent = fmt(data.providers);
-  document.getElementById('reasoning').textContent = fmt(data.reasoning);
-  document.getElementById('runtime').textContent = fmt({
-    timeouts: data.timeouts,
-    compaction: data.compaction,
-  });
-}
-load().catch((err) => {
-  document.body.innerHTML = `<main><pre>${err.stack || err.message}</pre></main>`;
-});
-</script>
-</body>
+        async function apiJson(method, path, body) {
+          setError("");
+          const r = await fetch(path, { method, headers: headers(), body: JSON.stringify(body) });
+          const data = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(data?.error?.message || `${r.status} ${r.statusText}`);
+          return data;
+        }
+
+        const [configPath, setConfigPath] = createSignal("");
+        const [configJson, setConfigJson] = createSignal("");
+
+        const [accountsSnapshot, setAccountsSnapshot] = createSignal({ accounts: [], sticky_bindings: 0 });
+        const [accessKeys, setAccessKeys] = createSignal([]);
+        const [createdKey, setCreatedKey] = createSignal(null);
+        const [usageKeys, setUsageKeys] = createSignal([]);
+        const [usageAccounts, setUsageAccounts] = createSignal([]);
+
+        async function refreshAll() {
+          setBusy(true);
+          try {
+            const cfg = await apiGet("/api/config");
+            setConfigPath(cfg.config_path || "");
+            setConfigJson(jsonPretty(cfg.config || {}));
+
+            const accounts = await apiGet("/api/accounts");
+            setAccountsSnapshot(accounts);
+
+            const keys = await apiGet("/api/access-keys");
+            setAccessKeys(keys.keys || []);
+
+            const uk = await apiGet("/api/usage/keys");
+            setUsageKeys(uk.keys || []);
+            const ua = await apiGet("/api/usage/accounts");
+            setUsageAccounts(ua.accounts || []);
+          } catch (e) {
+            setError(maskError(e));
+          } finally {
+            setBusy(false);
+          }
+        }
+
+        createEffect(() => {
+          localStorage.setItem(STORAGE_KEY, adminKey());
+        });
+
+        createEffect(() => {
+          refreshAll();
+        });
+
+        async function saveConfig() {
+          setBusy(true);
+          try {
+            const parsed = JSON.parse(configJson());
+            const saved = await apiJson("POST", "/api/config", parsed);
+            setConfigPath(saved.config_path || "");
+            setConfigJson(jsonPretty(saved.config || {}));
+          } catch (e) {
+            setError(maskError(e));
+          } finally {
+            setBusy(false);
+          }
+        }
+
+        const [newKeyId, setNewKeyId] = createSignal("");
+        const [newKeyName, setNewKeyName] = createSignal("");
+        const [newKeyAdmin, setNewKeyAdmin] = createSignal(false);
+        const [newKeyEnabled, setNewKeyEnabled] = createSignal(true);
+
+        async function createAccessKey() {
+          setBusy(true);
+          setCreatedKey(null);
+          try {
+            const resp = await apiJson("POST", "/api/access-keys", {
+              id: newKeyId().trim() || null,
+              name: newKeyName().trim() || null,
+              is_admin: !!newKeyAdmin(),
+              enabled: !!newKeyEnabled(),
+            });
+            setCreatedKey(resp);
+            setNewKeyId("");
+            setNewKeyName("");
+            setNewKeyAdmin(false);
+            setNewKeyEnabled(true);
+            const keys = await apiGet("/api/access-keys");
+            setAccessKeys(keys.keys || []);
+          } catch (e) {
+            setError(maskError(e));
+          } finally {
+            setBusy(false);
+          }
+        }
+
+        async function deleteAccessKey(id) {
+          setBusy(true);
+          try {
+            await fetch(`/api/access-keys/${encodeURIComponent(id)}`, {
+              method: "DELETE",
+              headers: headers(),
+            }).then(async (r) => {
+              const data = await r.json().catch(() => ({}));
+              if (!r.ok) throw new Error(data?.error?.message || `${r.status} ${r.statusText}`);
+              return data;
+            });
+            const keys = await apiGet("/api/access-keys");
+            setAccessKeys(keys.keys || []);
+          } catch (e) {
+            setError(maskError(e));
+          } finally {
+            setBusy(false);
+          }
+        }
+
+        function Card(props) {
+          return (
+            <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+              <div class="mb-3 flex items-center justify-between gap-3">
+                <h2 class="text-sm font-semibold text-slate-100">{props.title}</h2>
+                <div class="text-xs text-slate-400">{props.right}</div>
+              </div>
+              {props.children}
+            </div>
+          );
+        }
+
+        function Tabs() {
+          const items = [
+            ["overview", "Overview"],
+            ["accounts", "Accounts"],
+            ["keys", "Access Keys"],
+            ["usage", "Usage"],
+            ["config", "Config"],
+          ];
+          return (
+            <div class="flex flex-wrap gap-2">
+              <For each={items}>
+                {([id, label]) => (
+                  <button
+                    class={`rounded-lg px-3 py-1.5 text-sm ${
+                      tab() === id
+                        ? "bg-slate-100 text-slate-950"
+                        : "bg-slate-800/60 text-slate-200 hover:bg-slate-800"
+                    }`}
+                    onClick={() => setTab(id)}
+                  >
+                    {label}
+                  </button>
+                )}
+              </For>
+            </div>
+          );
+        }
+
+        return (
+          <div class="min-h-screen">
+            <header class="sticky top-0 z-10 border-b border-slate-800 bg-slate-950/70 backdrop-blur">
+              <div class="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-3 md:flex-row md:items-center md:justify-between">
+                <div class="flex items-center gap-3">
+                  <div class="h-9 w-9 rounded-xl bg-slate-800"></div>
+                  <div>
+                    <div class="text-sm font-semibold">codex-proxy Admin</div>
+                    <div class="text-xs text-slate-400">{configPath() ? `Config: ${configPath()}` : "Config: (unknown)"}</div>
+                  </div>
+                </div>
+                <div class="flex flex-col gap-2 md:flex-row md:items-center">
+                  <input
+                    class="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 md:w-96"
+                    placeholder="Admin access key (x-codex-proxy-key)"
+                    value={adminKey()}
+                    onInput={(e) => setAdminKey(e.currentTarget.value)}
+                  />
+                  <button
+                    class="rounded-lg bg-indigo-500 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-50"
+                    onClick={refreshAll}
+                    disabled={busy()}
+                  >
+                    Refresh
+                  </button>
+                </div>
+              </div>
+            </header>
+
+            <main class="mx-auto grid max-w-6xl gap-4 px-4 py-4">
+              <Tabs />
+
+              <Show when={error()}>
+                <div class="rounded-xl border border-rose-900/60 bg-rose-950/40 p-3 text-sm text-rose-100">
+                  {error()}
+                </div>
+              </Show>
+
+              <Show when={tab() === "overview"}>
+                <div class="grid gap-4 md:grid-cols-2">
+                  <Card title="Runtime" right={busy() ? "busy" : "idle"}>
+                    <div class="grid grid-cols-2 gap-3 text-sm">
+                      <div class="rounded-lg bg-slate-950/60 p-3">
+                        <div class="text-xs text-slate-400">Accounts</div>
+                        <div class="mt-1 text-lg font-semibold">{(accountsSnapshot()?.accounts || []).length}</div>
+                      </div>
+                      <div class="rounded-lg bg-slate-950/60 p-3">
+                        <div class="text-xs text-slate-400">Sticky bindings</div>
+                        <div class="mt-1 text-lg font-semibold">{accountsSnapshot()?.sticky_bindings || 0}</div>
+                      </div>
+                    </div>
+                    <div class="mt-3 text-xs text-slate-400">
+                      Admin APIs require an admin access key in config `access.keys[]`.
+                    </div>
+                  </Card>
+                  <Card title="Notes">
+                    <ul class="list-disc pl-5 text-sm text-slate-200">
+                      <li>Incoming auth accepts `x-codex-proxy-key`, `x-api-key`, or `Authorization: Bearer`.</li>
+                      <li>For Z.AI Authorization passthrough, prefer `x-codex-proxy-key` for proxy auth.</li>
+                      <li>Config save persists to the currently loaded config path.</li>
+                    </ul>
+                  </Card>
+                </div>
+              </Show>
+
+              <Show when={tab() === "accounts"}>
+                <Card title="Account Health" right="GET /api/accounts">
+                  <div class="overflow-auto">
+                    <table class="min-w-full text-sm">
+                      <thead class="text-left text-xs text-slate-400">
+                        <tr>
+                          <th class="px-3 py-2">ID</th>
+                          <th class="px-3 py-2">Provider</th>
+                          <th class="px-3 py-2">Alive</th>
+                          <th class="px-3 py-2">Failures</th>
+                          <th class="px-3 py-2">Cache hits</th>
+                          <th class="px-3 py-2">Unhealthy until</th>
+                          <th class="px-3 py-2">Auth</th>
+                        </tr>
+                      </thead>
+                      <tbody class="divide-y divide-slate-800">
+                        <For each={accountsSnapshot()?.accounts || []}>
+                          {(a) => (
+                            <tr>
+                              <td class="px-3 py-2 font-mono text-xs">{a.id}</td>
+                              <td class="px-3 py-2">{a.provider}</td>
+                              <td class="px-3 py-2">
+                                <span class={`rounded px-2 py-0.5 text-xs ${a.alive ? "bg-emerald-500/20 text-emerald-200" : "bg-rose-500/20 text-rose-200"}`}>
+                                  {a.alive ? "healthy" : "unhealthy"}
+                                </span>
+                              </td>
+                              <td class="px-3 py-2">{a.consecutive_failures}</td>
+                              <td class="px-3 py-2">{a.cache_key_hits}</td>
+                              <td class="px-3 py-2 font-mono text-xs">{a.unhealthy_until || ""}</td>
+                              <td class="px-3 py-2 font-mono text-xs">{a.auth?.api_key_masked || a.auth?.creds_path || a.auth?.auth_type}</td>
+                            </tr>
+                          )}
+                        </For>
+                      </tbody>
+                    </table>
+                  </div>
+                </Card>
+              </Show>
+
+              <Show when={tab() === "keys"}>
+                <div class="grid gap-4 md:grid-cols-2">
+                  <Card title="Create Access Key" right="POST /api/access-keys">
+                    <div class="grid gap-2 text-sm">
+                      <label class="text-xs text-slate-400">ID (optional)</label>
+                      <input class="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2"
+                        value={newKeyId()} onInput={(e) => setNewKeyId(e.currentTarget.value)} />
+                      <label class="text-xs text-slate-400">Name (optional)</label>
+                      <input class="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2"
+                        value={newKeyName()} onInput={(e) => setNewKeyName(e.currentTarget.value)} />
+                      <div class="mt-2 flex items-center gap-3">
+                        <label class="flex items-center gap-2">
+                          <input type="checkbox" checked={newKeyEnabled()} onChange={(e) => setNewKeyEnabled(e.currentTarget.checked)} />
+                          <span>Enabled</span>
+                        </label>
+                        <label class="flex items-center gap-2">
+                          <input type="checkbox" checked={newKeyAdmin()} onChange={(e) => setNewKeyAdmin(e.currentTarget.checked)} />
+                          <span>Admin</span>
+                        </label>
+                      </div>
+                      <button class="mt-2 rounded-lg bg-indigo-500 px-3 py-2 font-semibold text-white hover:bg-indigo-400 disabled:opacity-50"
+                        onClick={createAccessKey} disabled={busy()}>
+                        Create
+                      </button>
+                      <Show when={createdKey()}>
+                        <div class="mt-3 rounded-lg border border-emerald-900/60 bg-emerald-950/30 p-3">
+                          <div class="text-xs text-emerald-200">Created key (copy once)</div>
+                          <div class="mt-1 font-mono text-xs text-emerald-100 break-all">{createdKey().key}</div>
+                          <div class="mt-1 text-xs text-emerald-200">ID: {createdKey().id}</div>
+                        </div>
+                      </Show>
+                    </div>
+                  </Card>
+                  <Card title="Access Keys" right="GET /api/access-keys">
+                    <div class="overflow-auto">
+                      <table class="min-w-full text-sm">
+                        <thead class="text-left text-xs text-slate-400">
+                          <tr>
+                            <th class="px-3 py-2">ID</th>
+                            <th class="px-3 py-2">Enabled</th>
+                            <th class="px-3 py-2">Admin</th>
+                            <th class="px-3 py-2">SHA256</th>
+                            <th class="px-3 py-2"></th>
+                          </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-800">
+                          <For each={accessKeys()}>
+                            {(k) => (
+                              <tr>
+                                <td class="px-3 py-2 font-mono text-xs">{k.id}</td>
+                                <td class="px-3 py-2">{k.enabled ? "yes" : "no"}</td>
+                                <td class="px-3 py-2">{k.is_admin ? "yes" : "no"}</td>
+                                <td class="px-3 py-2 font-mono text-xs">{(k.key_sha256 || "").slice(0, 12)}…</td>
+                                <td class="px-3 py-2 text-right">
+                                  <button class="rounded bg-rose-500/20 px-2 py-1 text-xs text-rose-200 hover:bg-rose-500/30"
+                                    onClick={() => deleteAccessKey(k.id)} disabled={busy()}>
+                                    Delete
+                                  </button>
+                                </td>
+                              </tr>
+                            )}
+                          </For>
+                        </tbody>
+                      </table>
+                    </div>
+                  </Card>
+                </div>
+              </Show>
+
+              <Show when={tab() === "usage"}>
+                <div class="grid gap-4 md:grid-cols-2">
+                  <Card title="Usage by Access Key" right="GET /api/usage/keys">
+                    <div class="overflow-auto">
+                      <table class="min-w-full text-sm">
+                        <thead class="text-left text-xs text-slate-400">
+                          <tr>
+                            <th class="px-3 py-2">Key</th>
+                            <th class="px-3 py-2">Requests</th>
+                            <th class="px-3 py-2">Errors</th>
+                            <th class="px-3 py-2">Last</th>
+                          </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-800">
+                          <For each={usageKeys()}>
+                            {(u) => (
+                              <tr>
+                                <td class="px-3 py-2 font-mono text-xs">{u.key_id}</td>
+                                <td class="px-3 py-2">{u.requests}</td>
+                                <td class="px-3 py-2">{u.errors}</td>
+                                <td class="px-3 py-2 font-mono text-xs">{u.last_seen_at || ""}</td>
+                              </tr>
+                            )}
+                          </For>
+                        </tbody>
+                      </table>
+                    </div>
+                  </Card>
+                  <Card title="Usage by Upstream Account" right="GET /api/usage/accounts">
+                    <div class="overflow-auto">
+                      <table class="min-w-full text-sm">
+                        <thead class="text-left text-xs text-slate-400">
+                          <tr>
+                            <th class="px-3 py-2">Provider</th>
+                            <th class="px-3 py-2">Account</th>
+                            <th class="px-3 py-2">Requests</th>
+                            <th class="px-3 py-2">Errors</th>
+                            <th class="px-3 py-2">Cache</th>
+                          </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-800">
+                          <For each={usageAccounts()}>
+                            {(u) => (
+                              <tr>
+                                <td class="px-3 py-2">{u.provider}</td>
+                                <td class="px-3 py-2 font-mono text-xs">{u.account_id}</td>
+                                <td class="px-3 py-2">{u.requests}</td>
+                                <td class="px-3 py-2">{u.errors}</td>
+                                <td class="px-3 py-2">{u.cache_hits}</td>
+                              </tr>
+                            )}
+                          </For>
+                        </tbody>
+                      </table>
+                    </div>
+                  </Card>
+                </div>
+              </Show>
+
+              <Show when={tab() === "config"}>
+                <Card title="Config Editor" right="POST /api/config">
+                  <div class="grid gap-2">
+                    <div class="text-xs text-slate-400">
+                      This editor saves the full config file at the current config path.
+                    </div>
+                    <textarea
+                      class="h-[520px] w-full rounded-lg border border-slate-800 bg-slate-950 p-3 font-mono text-xs text-slate-100"
+                      value={configJson()}
+                      onInput={(e) => setConfigJson(e.currentTarget.value)}
+                      spellcheck="false"
+                    ></textarea>
+                    <div class="flex items-center justify-between gap-3">
+                      <div class="text-xs text-slate-500">Tip: API keys shown are masked in GET.</div>
+                      <button
+                        class="rounded-lg bg-emerald-500 px-3 py-2 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-50"
+                        onClick={saveConfig}
+                        disabled={busy()}
+                      >
+                        Save
+                      </button>
+                    </div>
+                  </div>
+                </Card>
+              </Show>
+            </main>
+          </div>
+        );
+      }
+
+      render(() => <App />, document.getElementById("app"));
+    </script>
+  </body>
 </html>
+

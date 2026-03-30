@@ -46,31 +46,7 @@ pub enum ConfigError {
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
-        let (status, code, message) = match &self {
-            ProxyError::Validation(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
-            ProxyError::Provider(msg) => (StatusCode::BAD_GATEWAY, "provider_error", msg.clone()),
-            ProxyError::Auth(msg) => (StatusCode::UNAUTHORIZED, "auth_error", msg.clone()),
-            ProxyError::Config(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "config_error",
-                msg.to_string(),
-            ),
-            ProxyError::Http(e) => {
-                let status = e
-                    .status()
-                    .map(|s| {
-                        let u16_val: u16 = s.as_u16();
-                        StatusCode::from_u16(u16_val).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-                    })
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                (status, "http_error", e.to_string())
-            }
-            ProxyError::Internal(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_server_error",
-                msg.clone(),
-            ),
-        };
+        let (status, code, message) = (self.status_code(), self.error_code(), self.to_string());
 
         #[derive(Serialize)]
         struct ErrorEnvelope {
@@ -90,5 +66,32 @@ impl IntoResponse for ProxyError {
             }),
         )
             .into_response()
+    }
+}
+
+impl ProxyError {
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            ProxyError::Validation(_) => StatusCode::BAD_REQUEST,
+            ProxyError::Provider(_) => StatusCode::BAD_GATEWAY,
+            ProxyError::Auth(_) => StatusCode::UNAUTHORIZED,
+            ProxyError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ProxyError::Http(e) => e
+                .status()
+                .and_then(|s| StatusCode::from_u16(s.as_u16()).ok())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            ProxyError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            ProxyError::Validation(_) => "bad_request",
+            ProxyError::Provider(_) => "provider_error",
+            ProxyError::Auth(_) => "auth_error",
+            ProxyError::Config(_) => "config_error",
+            ProxyError::Http(_) => "http_error",
+            ProxyError::Internal(_) => "internal_server_error",
+        }
     }
 }

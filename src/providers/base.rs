@@ -1,15 +1,19 @@
 use crate::account_pool::{Account, ResolvedRoute};
-use crate::config::EffectiveReasoningConfig;
+use crate::auth::GeminiAuthManager;
+use crate::config::{ConfigHandle, EffectiveReasoningConfig};
 use crate::error::ProxyError;
 use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
 use axum::body::Body;
 use axum::http::HeaderMap;
 use axum::response::Response;
+use std::sync::Arc;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProviderExecutionContext {
     pub route: ResolvedRoute,
     pub account: Account,
+    pub config: ConfigHandle,
+    pub gemini_auth: Arc<GeminiAuthManager>,
 }
 
 impl ProviderExecutionContext {

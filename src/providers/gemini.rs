@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::gemini_utils::{
     GeminiContent, GeminiPart, GeminiSystemInstruction, map_messages, sanitize_params,
 };
-use crate::auth::{AuthType, GEMINI_AUTH_MANAGER};
-use crate::config::CONFIG;
+use crate::auth::AuthType;
+use crate::config::with_config;
 use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::json_value::JsonValue;
@@ -37,7 +37,8 @@ impl GeminiProvider {
         req_data: &ChatRequest,
         context: &ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
-        let auth_ctx = GEMINI_AUTH_MANAGER
+        let auth_ctx = context
+            .gemini_auth
             .get_auth_context(&context.account, false)
             .await?;
         let model = context.upstream_model();
@@ -75,9 +76,10 @@ impl GeminiProvider {
             tool_config,
         };
 
-        let provider_config = CONFIG
-            .gemini_provider_config(context.provider())
-            .map_err(ProxyError::Config)?;
+        let provider_config = with_config(&context.config, |cfg| {
+            cfg.gemini_provider_config(context.provider())
+        })
+        .map_err(ProxyError::Config)?;
         let (url, req_headers, body_field) = match &auth_ctx.auth_type {
             AuthType::Public => {
                 let key = auth_ctx.api_key.as_ref().unwrap();
@@ -115,7 +117,10 @@ impl GeminiProvider {
                     .post(&url)
                     .headers(req_headers)
                     .json(&request_body)
-                    .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
+                    .timeout(std::time::Duration::from_secs(with_config(
+                        &context.config,
+                        |cfg| cfg.timeouts.read_seconds,
+                    )))
                     .send()
                     .await?
             }
@@ -130,7 +135,10 @@ impl GeminiProvider {
                     .post(&url)
                     .headers(req_headers)
                     .json(&internal)
-                    .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
+                    .timeout(std::time::Duration::from_secs(with_config(
+                        &context.config,
+                        |cfg| cfg.timeouts.read_seconds,
+                    )))
                     .send()
                     .await?
             }
@@ -164,6 +172,7 @@ impl GeminiProvider {
             &model_owned,
             created_ts,
             req_data,
+            with_config(&context.config, |cfg| cfg.server.debug_mode),
         );
         let body = Body::from_stream(sse_stream);
         Ok(Response::builder()
@@ -179,7 +188,8 @@ impl GeminiProvider {
         data: &CompactRequest,
         context: &ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
-        let auth_ctx = GEMINI_AUTH_MANAGER
+        let auth_ctx = context
+            .gemini_auth
             .get_auth_context(&context.account, false)
             .await?;
         let compaction_model = context.upstream_model();
@@ -223,7 +233,7 @@ impl GeminiProvider {
         let body = GeminiRequestBody {
             contents,
             generation_config: GeminiGenerationConfig {
-                temperature: CONFIG.compaction.temperature,
+                temperature: with_config(&context.config, |cfg| cfg.compaction.temperature),
                 top_p: 1.0,
                 max_output_tokens: Some(4096),
                 thinking_config: context.reasoning().and_then(|rc| {
@@ -238,9 +248,10 @@ impl GeminiProvider {
             tool_config: None,
         };
 
-        let provider_config = CONFIG
-            .gemini_provider_config(context.provider())
-            .map_err(ProxyError::Config)?;
+        let provider_config = with_config(&context.config, |cfg| {
+            cfg.gemini_provider_config(context.provider())
+        })
+        .map_err(ProxyError::Config)?;
         let (url, req_headers, send_body) = match &auth_ctx.auth_type {
             AuthType::Public => {
                 let key = auth_ctx.api_key.as_ref().unwrap();
@@ -278,7 +289,10 @@ impl GeminiProvider {
             .post(&url)
             .headers(req_headers)
             .json(&send_body)
-            .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
+            .timeout(std::time::Duration::from_secs(with_config(
+                &context.config,
+                |cfg| cfg.timeouts.read_seconds,
+            )))
             .send()
             .await?;
 

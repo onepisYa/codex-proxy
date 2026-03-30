@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 use crate::account_pool::AccountAuth;
-use crate::config::{CONFIG, EffectiveReasoningConfig};
+use crate::config::{EffectiveReasoningConfig, with_config};
 use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::json_value::JsonValue;
@@ -39,9 +39,10 @@ impl ZAIProvider {
         &self,
         context: &ProviderExecutionContext,
     ) -> Result<String, ProxyError> {
-        CONFIG
-            .endpoint_url(context.provider(), context.endpoint_name())
-            .map_err(ProxyError::Config)
+        with_config(&context.config, |cfg| {
+            cfg.endpoint_url(context.provider(), context.endpoint_name())
+        })
+        .map_err(ProxyError::Config)
     }
 
     async fn post_json<T: serde::Serialize>(
@@ -55,7 +56,10 @@ impl ZAIProvider {
             .post(endpoint_url)
             .header("Authorization", auth)
             .json(payload)
-            .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
+            .timeout(std::time::Duration::from_secs(with_config(
+                &context.config,
+                |cfg| cfg.timeouts.read_seconds,
+            )))
             .send()
             .await
             .map_err(ProxyError::Http)
@@ -192,7 +196,9 @@ impl ZAIProvider {
             stream: false,
             tools: None,
             tool_choice: None,
-            temperature: Some(CONFIG.compaction.temperature),
+            temperature: Some(with_config(&context.config, |cfg| {
+                cfg.compaction.temperature
+            })),
             top_p: None,
             max_tokens: Some(4096),
             thinking: context.reasoning().map(zai_thinking_config),
@@ -356,10 +362,12 @@ fn resolve_zai_auth(
 ) -> Result<String, ProxyError> {
     match &context.account.auth {
         AccountAuth::ApiKey { api_key } if !api_key.is_empty() => Ok(format!("Bearer {api_key}")),
-        _ if CONFIG
-            .zai_provider_config(context.provider())
-            .map_err(ProxyError::Config)?
-            .allow_authorization_passthrough => headers
+        _ if with_config(&context.config, |cfg| {
+            cfg.zai_provider_config(context.provider())
+                .map(|provider| provider.allow_authorization_passthrough)
+        })
+        .map_err(ProxyError::Config)?
+            => headers
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())

@@ -3,8 +3,9 @@ use axum::http::header;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 
-use crate::account_pool::{AccountPool, AccountStatus, RoutingState};
-use crate::config::CONFIG;
+use crate::account_pool::AccountStatus;
+use crate::config::with_config;
+use crate::state::AppState;
 
 const HTML: &str = include_str!("ui/index.html");
 
@@ -63,40 +64,39 @@ pub struct UiConfigUpdate {
     pub server: Option<serde_json::Value>,
 }
 
-pub fn get_current_config(account_pool: &AccountPool, routing_state: &RoutingState) -> UiConfig {
-    UiConfig {
+pub fn get_current_config(state: &AppState) -> UiConfig {
+    with_config(state.config(), |cfg| UiConfig {
         server: UiServerConfig {
-            host: CONFIG.server.host.clone(),
-            port: CONFIG.server.port,
-            log_level: CONFIG.server.log_level.clone(),
-            debug_mode: CONFIG.server.debug_mode,
+            host: cfg.server.host.clone(),
+            port: cfg.server.port,
+            log_level: cfg.server.log_level.clone(),
+            debug_mode: cfg.server.debug_mode,
         },
-        providers: CONFIG.providers.clone(),
+        providers: cfg.providers.clone(),
         models: UiModelsConfig {
-            served: CONFIG.models.served.clone(),
-            fallback_models: CONFIG.models.fallback_models.clone(),
+            served: cfg.models.served.clone(),
+            fallback_models: cfg.models.fallback_models.clone(),
         },
         routing: UiRoutingConfig {
-            model_overrides: CONFIG.routing.model_overrides.clone(),
-            preferred_models: CONFIG.routing.preferred_models.clone(),
-            sticky_routing: CONFIG.routing.sticky_routing.clone(),
-            health: CONFIG.routing.health.clone(),
+            model_overrides: cfg.routing.model_overrides.clone(),
+            preferred_models: cfg.routing.preferred_models.clone(),
+            sticky_routing: cfg.routing.sticky_routing.clone(),
+            health: cfg.routing.health.clone(),
         },
-        accounts: account_pool.all_accounts_snapshot(),
-        reasoning: CONFIG.reasoning.clone(),
-        timeouts: CONFIG.timeouts.clone(),
-        compaction: CONFIG.compaction.clone(),
+        accounts: state.accounts().all_accounts_snapshot(),
+        reasoning: cfg.reasoning.clone(),
+        timeouts: cfg.timeouts.clone(),
+        compaction: cfg.compaction.clone(),
         stats: UiStats {
-            account_count: account_pool.account_count(),
-            sticky_binding_count: routing_state.snapshot_size(),
+            account_count: state.accounts().account_count(),
+            sticky_binding_count: state.routing().snapshot_size(),
         },
-    }
+    })
 }
 
 pub fn apply_and_save(
     _data: &UiConfigUpdate,
-    account_pool: &AccountPool,
-    routing_state: &RoutingState,
+    state: &AppState,
 ) -> Result<UiConfig, crate::error::ProxyError> {
-    Ok(get_current_config(account_pool, routing_state))
+    Ok(get_current_config(state))
 }

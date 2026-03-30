@@ -78,6 +78,10 @@ impl RoutingState {
     pub fn snapshot_size(&self) -> usize {
         self.sticky_bindings.read().len()
     }
+
+    pub fn clear(&self) {
+        self.sticky_bindings.write().clear();
+    }
 }
 
 fn compute_cache_key(messages_prefix: &[(String, String)]) -> u64 {
@@ -336,12 +340,7 @@ mod tests {
     #[test]
     fn reuses_sticky_binding_when_still_healthy() {
         let pool = AccountPool::new();
-        pool.load_accounts(vec![account(
-            "openai",
-            "openai",
-            Some(vec!["gpt-4.1"]),
-            1,
-        )]);
+        pool.load_accounts(vec![account("openai", "openai", Some(vec!["gpt-4.1"]), 1)]);
         let state = RoutingState::new();
         let first = Router::resolve_route(
             &pool,

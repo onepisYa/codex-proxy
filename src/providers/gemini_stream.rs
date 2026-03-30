@@ -8,7 +8,6 @@ use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
-use crate::config::CONFIG;
 use crate::schema::json_value::JsonValue;
 use crate::schema::openai::ChatRequest;
 use crate::schema::sse::{
@@ -25,6 +24,7 @@ pub fn stream_responses_sse(
     model: &str,
     created_ts: i64,
     request: &ChatRequest,
+    debug_mode: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     let resp_id = resp_id.to_string();
     let model = model.to_string();
@@ -46,6 +46,7 @@ pub fn stream_responses_sse(
             ResponseCreatedData {
                 response: response_in_progress(&resp_id, &model, created_ts, &req),
             },
+            debug_mode,
         ));
 
         yield Ok(encode_event(
@@ -54,11 +55,13 @@ pub fn stream_responses_sse(
             crate::schema::sse::ModelsEtagData {
                 etag: "v1-gemini-gpt-5-2-parity",
             },
+            debug_mode,
         ));
         yield Ok(encode_event(
             &mut seq_num,
             "server_reasoning_included",
             ServerReasoningIncludedData { included: true },
+            debug_mode,
         ));
         yield Ok(encode_event(
             &mut seq_num,
@@ -72,6 +75,7 @@ pub fn stream_responses_sse(
                     balance: Some(JsonValue::Null),
                 },
             },
+            debug_mode,
         ));
 
         let mut byte_stream = std::pin::pin!(byte_stream);
@@ -157,6 +161,7 @@ pub fn stream_responses_sse(
                                 output_index: idx,
                                 item: item.clone(),
                             },
+                            debug_mode,
                         ));
 
                         let mut done_item = item;
@@ -169,6 +174,7 @@ pub fn stream_responses_sse(
                                 output_index: idx,
                                 item: done_item.clone(),
                             },
+                            debug_mode,
                         ));
                         completed_items.push((idx, done_item));
                         continue;
@@ -250,6 +256,7 @@ pub fn stream_responses_sse(
                                     content_index: 0,
                                     delta: text_buf.clone(),
                                 },
+                                debug_mode,
                             ));
 
                             // Update reasoning summary from full reasoning text.
@@ -303,6 +310,7 @@ pub fn stream_responses_sse(
                     output_index: idx,
                     item: item.clone(),
                 },
+                debug_mode,
             ));
             completed_items.push((idx, item));
         }
@@ -316,6 +324,7 @@ pub fn stream_responses_sse(
                     output_index: idx,
                     item: item.clone(),
                 },
+                debug_mode,
             ));
             completed_items.push((idx, item));
         }
@@ -339,6 +348,7 @@ pub fn stream_responses_sse(
             &mut seq_num,
             "response.completed",
             ResponseCompletedData { response: final_resp },
+            debug_mode,
         ));
     })
 }
@@ -481,7 +491,12 @@ fn extract_command_from_args(args: &str) -> Vec<String> {
     }
 }
 
-fn encode_event<T: Serialize>(seq_num: &mut u64, evt_type: &'static str, data: T) -> Bytes {
+fn encode_event<T: Serialize>(
+    seq_num: &mut u64,
+    evt_type: &'static str,
+    data: T,
+    debug_mode: bool,
+) -> Bytes {
     *seq_num += 1;
     let evt = ResponseEvent {
         id: format!("evt_{}_{}", now_ms(), seq_num),
@@ -491,7 +506,7 @@ fn encode_event<T: Serialize>(seq_num: &mut u64, evt_type: &'static str, data: T
         sequence_number: *seq_num,
         data,
     };
-    if CONFIG.server.debug_mode {
+    if debug_mode {
         debug!(
             "SSE OUT: {} - {}",
             evt_type,

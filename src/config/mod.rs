@@ -1,9 +1,10 @@
-use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::account_pool::AccountAuth;
@@ -253,7 +254,11 @@ impl ProviderConfig {
         }
     }
 
-    pub fn endpoint_url(&self, provider_name: &str, endpoint: Option<&str>) -> Result<String, ConfigError> {
+    pub fn endpoint_url(
+        &self,
+        provider_name: &str,
+        endpoint: Option<&str>,
+    ) -> Result<String, ConfigError> {
         match self {
             ProviderConfig::Gemini { api_public, .. } => match endpoint {
                 Some(name) => Err(ConfigError::InvalidValue(format!(
@@ -263,14 +268,10 @@ impl ProviderConfig {
                 None => Ok(api_public.clone()),
             },
             ProviderConfig::OpenAi {
-                api_url,
-                endpoints,
-                ..
+                api_url, endpoints, ..
             }
             | ProviderConfig::Zai {
-                api_url,
-                endpoints,
-                ..
+                api_url, endpoints, ..
             } => match endpoint {
                 Some(name) => endpoints.get(name).cloned().ok_or_else(|| {
                     ConfigError::InvalidValue(format!(
@@ -290,22 +291,27 @@ impl ProviderConfig {
                 api_public,
                 ..
             } => {
-                validate_url(api_internal, &format!("Provider '{}' gemini api_internal", provider_name))?;
-                validate_url(api_public, &format!("Provider '{}' gemini api_public", provider_name))?;
+                validate_url(
+                    api_internal,
+                    &format!("Provider '{}' gemini api_internal", provider_name),
+                )?;
+                validate_url(
+                    api_public,
+                    &format!("Provider '{}' gemini api_public", provider_name),
+                )?;
             }
             ProviderConfig::Zai {
-                api_url,
-                endpoints,
-                ..
+                api_url, endpoints, ..
             }
             | ProviderConfig::OpenAi {
-                api_url,
-                endpoints,
-                ..
+                api_url, endpoints, ..
             } => {
                 validate_url(api_url, &format!("Provider '{}' api_url", provider_name))?;
                 for (name, url) in endpoints {
-                    validate_url(url, &format!("Provider '{}' endpoint '{}'", provider_name, name))?;
+                    validate_url(
+                        url,
+                        &format!("Provider '{}' endpoint '{}'", provider_name, name),
+                    )?;
                 }
             }
         }
@@ -384,6 +390,35 @@ pub struct CompactionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessKeyConfig {
+    pub id: String,
+    pub key_sha256: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub is_admin: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessControlConfig {
+    #[serde(default)]
+    pub require_key: bool,
+    #[serde(default)]
+    pub keys: Vec<AccessKeyConfig>,
+}
+
+impl Default for AccessControlConfig {
+    fn default() -> Self {
+        Self {
+            require_key: false,
+            keys: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountConfig {
     pub id: String,
     pub provider: String,
@@ -404,9 +439,41 @@ pub struct Config {
     pub models: ModelsConfig,
     pub routing: RoutingConfig,
     pub accounts: Vec<AccountConfig>,
+    pub access: AccessControlConfig,
     pub reasoning: ReasoningConfig,
     pub timeouts: TimeoutsConfig,
     pub compaction: CompactionConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedConfig {
+    pub server: ServerConfig,
+    pub providers: ProvidersConfig,
+    pub models: ModelsConfig,
+    pub routing: RoutingConfig,
+    pub accounts: Vec<AccountConfig>,
+    #[serde(default)]
+    pub access: AccessControlConfig,
+    pub reasoning: ReasoningConfig,
+    pub timeouts: TimeoutsConfig,
+    pub compaction: CompactionConfig,
+}
+
+impl PersistedConfig {
+    pub fn into_runtime(self, config_path: PathBuf) -> Config {
+        Config {
+            config_path,
+            server: self.server,
+            providers: self.providers,
+            models: self.models,
+            routing: self.routing,
+            accounts: self.accounts,
+            access: self.access,
+            reasoning: self.reasoning,
+            timeouts: self.timeouts,
+            compaction: self.compaction,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -422,6 +489,8 @@ struct FileConfig {
     #[serde(default)]
     pub accounts: Option<Vec<AccountConfig>>,
     #[serde(default)]
+    pub access: Option<AccessControlConfig>,
+    #[serde(default)]
     pub reasoning: Option<ReasoningConfig>,
     #[serde(default)]
     pub timeouts: Option<TimeoutsConfig>,
@@ -429,7 +498,17 @@ struct FileConfig {
     pub compaction: Option<CompactionConfig>,
 }
 
-pub static CONFIG: Lazy<Config> = Lazy::new(Config::new);
+pub type ConfigHandle = Arc<RwLock<Config>>;
+
+pub fn with_config<T>(handle: &ConfigHandle, f: impl FnOnce(&Config) -> T) -> T {
+    let guard = handle.read();
+    f(&guard)
+}
+
+pub fn with_config_mut<T>(handle: &ConfigHandle, f: impl FnOnce(&mut Config) -> T) -> T {
+    let mut guard = handle.write();
+    f(&mut guard)
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -584,6 +663,7 @@ impl Config {
                 health: RoutingHealthConfig::default(),
             },
             accounts,
+            access: AccessControlConfig::default(),
             reasoning: ReasoningConfig::default(),
             timeouts: TimeoutsConfig {
                 connect_seconds: 10,
@@ -631,6 +711,9 @@ impl Config {
             if let Some(accounts) = file_cfg.accounts {
                 self.accounts = accounts;
             }
+            if let Some(access) = file_cfg.access {
+                self.access = access;
+            }
             if let Some(reasoning) = file_cfg.reasoning {
                 self.reasoning = reasoning;
             }
@@ -645,6 +728,35 @@ impl Config {
             info!("Loaded config from {}", self.config_path.display());
             return;
         }
+    }
+
+    pub fn to_persisted(&self) -> PersistedConfig {
+        PersistedConfig {
+            server: self.server.clone(),
+            providers: self.providers.clone(),
+            models: self.models.clone(),
+            routing: self.routing.clone(),
+            accounts: self.accounts.clone(),
+            access: self.access.clone(),
+            reasoning: self.reasoning.clone(),
+            timeouts: self.timeouts.clone(),
+            compaction: self.compaction.clone(),
+        }
+    }
+
+    pub fn save_to_path(&self, path: &Path) -> Result<(), ConfigError> {
+        let persisted = self.to_persisted();
+        let json = serde_json::to_string_pretty(&persisted)?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let tmp_path = parent.join(format!(
+            ".{}.tmp",
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("config.json")
+        ));
+        fs::write(&tmp_path, json)?;
+        fs::rename(&tmp_path, path)?;
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -674,8 +786,36 @@ impl Config {
             )));
         }
 
+        let mut seen_access_ids = HashSet::new();
+        let mut enabled_access_key_count = 0usize;
+        for key in &self.access.keys {
+            if !seen_access_ids.insert(key.id.clone()) {
+                return Err(ConfigError::InvalidValue(format!(
+                    "duplicate access key id: {}",
+                    key.id
+                )));
+            }
+            if key.enabled {
+                enabled_access_key_count += 1;
+            }
+            let hash = key.key_sha256.trim();
+            let is_hex_64 = hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit());
+            if !is_hex_64 {
+                return Err(ConfigError::InvalidValue(format!(
+                    "access.keys['{}'] key_sha256 must be 64 hex chars",
+                    key.id
+                )));
+            }
+        }
+        if self.access.require_key && enabled_access_key_count == 0 {
+            return Err(ConfigError::InvalidValue(
+                "access.require_key is true but no enabled access keys are configured".into(),
+            ));
+        }
+
         let mut seen_ids = HashSet::new();
-        let enabled_accounts: Vec<&AccountConfig> = self.accounts.iter().filter(|a| a.enabled).collect();
+        let enabled_accounts: Vec<&AccountConfig> =
+            self.accounts.iter().filter(|a| a.enabled).collect();
         if enabled_accounts.is_empty() {
             return Err(ConfigError::InvalidValue(
                 "accounts must contain at least one enabled account".into(),
@@ -771,18 +911,15 @@ impl Config {
             }
         }
 
-        if self.compaction.preferred_targets.is_empty() {
-            return Err(ConfigError::InvalidValue(
-                "compaction.preferred_targets must not be empty".into(),
-            ));
-        }
-        for target in &self.compaction.preferred_targets {
-            self.validate_route_target(target, "compaction.preferred_targets")?;
-        }
-        if !self.has_compatible_enabled_account(&self.compaction.preferred_targets) {
-            return Err(ConfigError::InvalidValue(
-                "compaction.preferred_targets has no compatible enabled account".into(),
-            ));
+        if !self.compaction.preferred_targets.is_empty() {
+            for target in &self.compaction.preferred_targets {
+                self.validate_route_target(target, "compaction.preferred_targets")?;
+            }
+            if !self.has_compatible_enabled_account(&self.compaction.preferred_targets) {
+                return Err(ConfigError::InvalidValue(
+                    "compaction.preferred_targets has no compatible enabled account".into(),
+                ));
+            }
         }
 
         for mapped_model in self.routing.model_overrides.values() {
@@ -817,7 +954,10 @@ impl Config {
             .unwrap_or_else(|| requested_model.to_string())
     }
 
-    pub fn preferred_targets_for_model(&self, requested_model: &str) -> Option<&[RouteTargetConfig]> {
+    pub fn preferred_targets_for_model(
+        &self,
+        requested_model: &str,
+    ) -> Option<&[RouteTargetConfig]> {
         let logical_model = self.resolve_logical_model(requested_model);
         self.routing
             .preferred_models
@@ -902,14 +1042,21 @@ impl Config {
         (!models.is_empty()).then_some(models)
     }
 
-    pub fn endpoint_url(&self, provider: &str, endpoint: Option<&str>) -> Result<String, ConfigError> {
+    pub fn endpoint_url(
+        &self,
+        provider: &str,
+        endpoint: Option<&str>,
+    ) -> Result<String, ConfigError> {
         self.providers
             .get(provider)
             .ok_or_else(|| ConfigError::InvalidValue(format!("Unknown provider '{}'", provider)))?
             .endpoint_url(provider, endpoint)
     }
 
-    pub fn gemini_provider_config(&self, provider: &str) -> Result<GeminiProviderConfig, ConfigError> {
+    pub fn gemini_provider_config(
+        &self,
+        provider: &str,
+    ) -> Result<GeminiProviderConfig, ConfigError> {
         self.providers
             .get(provider)
             .and_then(ProviderConfig::as_gemini)
@@ -933,7 +1080,11 @@ impl Config {
             })
     }
 
-    fn validate_route_target(&self, target: &RouteTargetConfig, scope: &str) -> Result<(), ConfigError> {
+    fn validate_route_target(
+        &self,
+        target: &RouteTargetConfig,
+        scope: &str,
+    ) -> Result<(), ConfigError> {
         if target.provider.trim().is_empty() {
             return Err(ConfigError::InvalidValue(format!(
                 "{scope} contains an empty provider name"
@@ -1092,6 +1243,7 @@ mod tests {
                     api_key: "sk-test".into(),
                 },
             }],
+            access: AccessControlConfig::default(),
             reasoning: ReasoningConfig::default(),
             timeouts: TimeoutsConfig {
                 connect_seconds: 10,
@@ -1144,5 +1296,12 @@ mod tests {
     fn resolves_provider_type_from_dynamic_provider_name() {
         let cfg = base_config();
         assert_eq!(cfg.provider_type("tabcode").unwrap(), ProviderType::OpenAi);
+    }
+
+    #[test]
+    fn allows_empty_compaction_targets() {
+        let mut cfg = base_config();
+        cfg.compaction.preferred_targets = Vec::new();
+        assert!(cfg.validate().is_ok());
     }
 }

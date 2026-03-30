@@ -6,49 +6,44 @@ pub mod openai;
 pub mod zai;
 pub mod zai_stream;
 
-use once_cell::sync::Lazy;
-use parking_lot::RwLock;
 use std::collections::HashMap;
 
-use crate::config::{ProviderType, CONFIG};
+use crate::config::{ProviderType, with_config};
+use crate::state::AppState;
 use base::Provider;
 use gemini::GeminiProvider;
 use openai::OpenAiProvider;
 use zai::ZAIProvider;
 
-struct RegistryInner {
+pub struct ProviderRegistry {
     providers: HashMap<ProviderType, Box<dyn Provider + Send + Sync>>,
 }
 
-static REGISTRY: Lazy<RwLock<RegistryInner>> = Lazy::new(|| {
-    RwLock::new(RegistryInner {
-        providers: HashMap::new(),
-    })
-});
+impl ProviderRegistry {
+    pub fn new() -> Self {
+        let mut providers: HashMap<ProviderType, Box<dyn Provider + Send + Sync>> = HashMap::new();
+        providers.insert(ProviderType::Gemini, Box::new(GeminiProvider::new()));
+        providers.insert(ProviderType::Zai, Box::new(ZAIProvider::new()));
+        providers.insert(ProviderType::OpenAi, Box::new(OpenAiProvider::new()));
+        Self { providers }
+    }
 
-pub fn initialize_registry() {
-    let mut reg = REGISTRY.write();
-    reg.providers.clear();
-    reg.providers
-        .insert(ProviderType::Gemini, Box::new(GeminiProvider::new()));
-    reg.providers
-        .insert(ProviderType::Zai, Box::new(ZAIProvider::new()));
-    reg.providers
-        .insert(ProviderType::OpenAi, Box::new(OpenAiProvider::new()));
+    pub fn get(&self, provider_type: ProviderType) -> Box<dyn Provider + Send + Sync> {
+        if let Some(provider) = self.providers.get(&provider_type) {
+            return provider.clone_box();
+        }
+        match provider_type {
+            ProviderType::Gemini => Box::new(GeminiProvider::new()),
+            ProviderType::Zai => Box::new(ZAIProvider::new()),
+            ProviderType::OpenAi => Box::new(OpenAiProvider::new()),
+        }
+    }
 }
 
-pub fn get_provider(provider_name: &str) -> Box<dyn Provider + Send + Sync> {
-    let provider_type = CONFIG
-        .provider_type(provider_name)
-        .expect("provider referenced by route/account must exist in config");
-
-    if let Some(provider) = REGISTRY.read().providers.get(&provider_type) {
-        return provider.clone_box();
-    }
-
-    match provider_type {
-        ProviderType::Gemini => Box::new(GeminiProvider::new()),
-        ProviderType::Zai => Box::new(ZAIProvider::new()),
-        ProviderType::OpenAi => Box::new(OpenAiProvider::new()),
-    }
+pub fn get_provider(state: &AppState, provider_name: &str) -> Box<dyn Provider + Send + Sync> {
+    let provider_type = with_config(state.config(), |cfg| {
+        cfg.provider_type(provider_name)
+            .expect("provider referenced by route/account must exist in config")
+    });
+    state.providers().get(provider_type)
 }

@@ -1,4 +1,8 @@
-use codex_proxy::server::{build_router, print_startup_info};
+use codex_proxy::config::{Config, with_config};
+use codex_proxy::server::build_router;
+use codex_proxy::state::AppState;
+use parking_lot::RwLock;
+use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::fmt::format::FmtSpan;
 
@@ -15,12 +19,13 @@ async fn main() {
 
     info!("Starting codex-proxy...");
 
-    let config = &codex_proxy::config::CONFIG;
-    let addr = format!("{}:{}", config.server.host, config.server.port);
-
-    print_startup_info();
-
-    let app = build_router();
+    let config = Config::new();
+    let config_handle = Arc::new(RwLock::new(config));
+    let addr = with_config(&config_handle, |cfg| {
+        format!("{}:{}", cfg.server.host, cfg.server.port)
+    });
+    let state = AppState::new(config_handle.clone());
+    let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("Failed to bind");

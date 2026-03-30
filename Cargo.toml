@@ -21,6 +21,8 @@ thiserror = "2"
 regex = "1"
 async-stream = "0.3"
 bytes = "1"
+rand = "0.8"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 3
