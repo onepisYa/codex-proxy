@@ -6,6 +6,7 @@ use crate::auth::GeminiAuthManager;
 use crate::config::ConfigHandle;
 use crate::model_catalog::ModelCatalog;
 use crate::providers::ProviderRegistry;
+use crate::session::SessionStore;
 use crate::usage::UsageStore;
 
 #[derive(Clone)]
@@ -23,10 +24,14 @@ struct AppStateInner {
     pub recovery_probes_started: AtomicBool,
     pub model_discovery_started: AtomicBool,
     pub model_catalog: ModelCatalog,
+    pub sessions: SessionStore,
 }
 
 impl AppState {
     pub fn new(config: ConfigHandle) -> Self {
+        let ttl_seconds =
+            crate::config::with_config(&config, |cfg| cfg.session.response_id_ttl_seconds);
+        let sessions = SessionStore::new(std::time::Duration::from_secs(ttl_seconds));
         Self {
             inner: Arc::new(AppStateInner {
                 config: config.clone(),
@@ -38,6 +43,7 @@ impl AppState {
                 recovery_probes_started: AtomicBool::new(false),
                 model_discovery_started: AtomicBool::new(false),
                 model_catalog: ModelCatalog::new(),
+                sessions,
             }),
         }
     }
@@ -76,5 +82,9 @@ impl AppState {
 
     pub fn model_catalog(&self) -> &ModelCatalog {
         &self.inner.model_catalog
+    }
+
+    pub fn sessions(&self) -> &SessionStore {
+        &self.inner.sessions
     }
 }

@@ -405,6 +405,82 @@ fn default_model_discovery_interval_seconds() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    #[serde(default = "default_session_header_name")]
+    pub header_name: String,
+    #[serde(default = "default_session_metadata_key")]
+    pub metadata_key: String,
+    #[serde(default = "default_session_response_id_ttl_seconds")]
+    pub response_id_ttl_seconds: u64,
+}
+
+fn default_session_header_name() -> String {
+    "x-codex-proxy-session".into()
+}
+
+fn default_session_metadata_key() -> String {
+    "codex_proxy_session".into()
+}
+
+fn default_session_response_id_ttl_seconds() -> u64 {
+    24 * 60 * 60
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            header_name: default_session_header_name(),
+            metadata_key: default_session_metadata_key(),
+            response_id_ttl_seconds: default_session_response_id_ttl_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoCompactionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_auto_compaction_max_attempts")]
+    pub max_attempts_per_request: u32,
+    #[serde(default = "default_auto_compaction_tail_items")]
+    pub tail_items_to_keep: usize,
+    #[serde(default = "default_auto_compaction_compact_instructions")]
+    pub compact_instructions: String,
+    #[serde(default = "default_auto_compaction_summary_instructions")]
+    pub summary_instructions: String,
+}
+
+fn default_auto_compaction_max_attempts() -> u32 {
+    1
+}
+
+fn default_auto_compaction_tail_items() -> usize {
+    8
+}
+
+fn default_auto_compaction_compact_instructions() -> String {
+    "Compact the conversation history for continued use. Preserve all tool and file context needed to continue the session."
+        .into()
+}
+
+fn default_auto_compaction_summary_instructions() -> String {
+    "Summarize the conversation history so far for continued use. Preserve key decisions, constraints, open tasks, file paths, and relevant technical details. Be concise but complete."
+        .into()
+}
+
+impl Default for AutoCompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_attempts_per_request: default_auto_compaction_max_attempts(),
+            tail_items_to_keep: default_auto_compaction_tail_items(),
+            compact_instructions: default_auto_compaction_compact_instructions(),
+            summary_instructions: default_auto_compaction_summary_instructions(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricingConfig {
     #[serde(default)]
     pub input_per_mtoken: Option<f64>,
@@ -582,6 +658,8 @@ pub struct Config {
     pub model_discovery: ModelDiscoveryConfig,
     pub model_metadata: ProviderModelMetadataConfig,
     pub models_endpoint: ModelsEndpointConfig,
+    pub session: SessionConfig,
+    pub auto_compaction: AutoCompactionConfig,
     pub routing: RoutingConfig,
     pub accounts: Vec<AccountConfig>,
     pub access: AccessControlConfig,
@@ -601,6 +679,10 @@ pub struct PersistedConfig {
     pub model_metadata: ProviderModelMetadataConfig,
     #[serde(default)]
     pub models_endpoint: ModelsEndpointConfig,
+    #[serde(default)]
+    pub session: SessionConfig,
+    #[serde(default)]
+    pub auto_compaction: AutoCompactionConfig,
     pub routing: RoutingConfig,
     pub accounts: Vec<AccountConfig>,
     #[serde(default)]
@@ -620,6 +702,8 @@ impl PersistedConfig {
             model_discovery: self.model_discovery,
             model_metadata: self.model_metadata,
             models_endpoint: self.models_endpoint,
+            session: self.session,
+            auto_compaction: self.auto_compaction,
             routing: self.routing,
             accounts: self.accounts,
             access: self.access,
@@ -644,6 +728,10 @@ struct FileConfig {
     pub model_metadata: Option<ProviderModelMetadataConfig>,
     #[serde(default)]
     pub models_endpoint: Option<ModelsEndpointConfig>,
+    #[serde(default)]
+    pub session: Option<SessionConfig>,
+    #[serde(default)]
+    pub auto_compaction: Option<AutoCompactionConfig>,
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
     #[serde(default)]
@@ -825,6 +913,8 @@ impl Config {
             model_discovery: ModelDiscoveryConfig::default(),
             model_metadata: ProviderModelMetadataConfig::new(),
             models_endpoint: ModelsEndpointConfig::default(),
+            session: SessionConfig::default(),
+            auto_compaction: AutoCompactionConfig::default(),
             routing: RoutingConfig {
                 model_overrides: HashMap::new(),
                 preferred_models: HashMap::new(),
@@ -889,6 +979,12 @@ impl Config {
             if let Some(models_endpoint) = file_cfg.models_endpoint {
                 self.models_endpoint = models_endpoint;
             }
+            if let Some(session) = file_cfg.session {
+                self.session = session;
+            }
+            if let Some(auto_compaction) = file_cfg.auto_compaction {
+                self.auto_compaction = auto_compaction;
+            }
             if let Some(routing) = file_cfg.routing {
                 self.routing = routing;
             }
@@ -923,6 +1019,8 @@ impl Config {
             model_discovery: self.model_discovery.clone(),
             model_metadata: self.model_metadata.clone(),
             models_endpoint: self.models_endpoint.clone(),
+            session: self.session.clone(),
+            auto_compaction: self.auto_compaction.clone(),
             routing: self.routing.clone(),
             accounts: self.accounts.clone(),
             access: self.access.clone(),
@@ -1462,6 +1560,8 @@ mod tests {
             model_discovery: ModelDiscoveryConfig::default(),
             model_metadata: ProviderModelMetadataConfig::new(),
             models_endpoint: ModelsEndpointConfig::default(),
+            session: SessionConfig::default(),
+            auto_compaction: AutoCompactionConfig::default(),
             routing: RoutingConfig {
                 model_overrides: HashMap::new(),
                 preferred_models: HashMap::from([(

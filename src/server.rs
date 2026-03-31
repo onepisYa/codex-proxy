@@ -1,4 +1,5 @@
 use axum::body::Body;
+use axum::body::to_bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::Response;
@@ -34,6 +35,7 @@ pub fn build_router(state: AppState) -> Router {
             header::AUTHORIZATION,
             header::HeaderName::from_static("x-api-key"),
             header::HeaderName::from_static("x-codex-proxy-key"),
+            header::HeaderName::from_static("x-codex-proxy-session"),
         ]);
 
     Router::new()
@@ -375,8 +377,16 @@ async fn responses_handler(
     let request_bytes = serde_json::to_vec(&data)
         .map(|v| v.len() as u64)
         .unwrap_or(0);
+
+    let session_key = resolve_session_key(&state, &headers, &data)?;
+    let cache_key_override = Some(session_key.cache_key_override());
     let normalized = normalizer::normalize(data.clone());
-    let route = resolve_response_route(&state, &data.model, &normalized.messages)?;
+    let route = resolve_response_route(
+        &state,
+        &data.model,
+        &normalized.messages,
+        cache_key_override,
+    )?;
     let provider = crate::providers::get_provider(&state, &route.provider);
     let (account, _) = state
         .accounts()
@@ -389,10 +399,66 @@ async fn responses_handler(
         gemini_auth: state.gemini_auth(),
     };
 
-    let result = provider
-        .handle_request(data, normalized, headers, context.clone())
-        .await;
-    record_and_apply_result(&state, &access_key, &context, request_bytes, result)
+    let auto_cfg = with_config(state.config(), |cfg| cfg.auto_compaction.clone());
+    let provider_type = with_config(state.config(), |cfg| cfg.provider_type(&route.provider))
+        .map_err(ProxyError::Config)?;
+
+    let mut attempt = 0u32;
+    let mut current_request = data.clone();
+    let mut current_normalized = normalized;
+    let mut auto_compacted = false;
+    let final_result = loop {
+        let result = provider
+            .handle_request(
+                current_request.clone(),
+                current_normalized.clone(),
+                headers.clone(),
+                context.clone(),
+            )
+            .await;
+
+        match result {
+            Ok(resp) => break Ok(resp),
+            Err(err) => {
+                if !auto_cfg.enabled
+                    || attempt >= auto_cfg.max_attempts_per_request
+                    || !is_context_length_error(&err)
+                {
+                    break Err(err);
+                }
+
+                attempt += 1;
+                let compacted = auto_compact_request(
+                    &state,
+                    &current_request,
+                    &auto_cfg,
+                    provider_type,
+                    cache_key_override,
+                    &current_normalized.messages,
+                )
+                .await?;
+                current_request = compacted;
+                current_normalized = normalizer::normalize(current_request.clone());
+                auto_compacted = true;
+            }
+        }
+    };
+
+    let final_result = match final_result {
+        Ok(resp) => {
+            let mut resp = finalize_response(&state, resp, &session_key).await;
+            if auto_compacted {
+                resp.headers_mut().insert(
+                    header::HeaderName::from_static("x-codex-proxy-auto-compacted"),
+                    header::HeaderValue::from_static("true"),
+                );
+            }
+            Ok(resp)
+        }
+        Err(err) => Err(err),
+    };
+
+    record_and_apply_result(&state, &access_key, &context, request_bytes, final_result)
 }
 
 async fn compact_handler(
@@ -421,7 +487,7 @@ async fn compact_handler(
         stream: Some(false),
         include: None,
     });
-    let route = resolve_compaction_route(&state, &normalized.messages)?;
+    let route = resolve_compaction_route(&state, &normalized.messages, None)?;
     let provider_type = with_config(state.config(), |cfg| cfg.provider_type(&route.provider))
         .map_err(ProxyError::Config)?;
     if provider_type != crate::config::ProviderType::OpenAi {
@@ -452,6 +518,7 @@ fn resolve_response_route(
     state: &AppState,
     requested_model: &str,
     messages: &[ChatMessage],
+    cache_key_override: Option<u64>,
 ) -> Result<crate::account_pool::ResolvedRoute, ProxyError> {
     let logical_model = with_config(state.config(), |cfg| {
         cfg.resolve_logical_model(requested_model)
@@ -482,12 +549,14 @@ fn resolve_response_route(
         state.routing(),
         &candidates,
         messages,
+        cache_key_override,
     )
 }
 
 fn resolve_compaction_route(
     state: &AppState,
     messages: &[ChatMessage],
+    cache_key_override: Option<u64>,
 ) -> Result<crate::account_pool::ResolvedRoute, ProxyError> {
     let targets = with_config(state.config(), |cfg| cfg.compaction_targets().to_vec());
     if targets.is_empty() {
@@ -512,7 +581,524 @@ fn resolve_compaction_route(
         state.routing(),
         &candidates,
         messages,
+        cache_key_override,
     )
+}
+
+fn resolve_session_key(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: &ResponsesRequest,
+) -> Result<crate::session::SessionKey, ProxyError> {
+    let (header_name, metadata_key) = with_config(state.config(), |cfg| {
+        (
+            cfg.session.header_name.clone(),
+            cfg.session.metadata_key.clone(),
+        )
+    });
+
+    if let Some(key) = crate::session::extract_session_key_from_headers(headers, &header_name) {
+        return Ok(key);
+    }
+
+    let metadata_json = request
+        .metadata
+        .as_ref()
+        .and_then(|m| serde_json::to_value(m).ok());
+    if let Some(key) =
+        crate::session::extract_session_key_from_metadata(metadata_json.as_ref(), &metadata_key)
+    {
+        return Ok(key);
+    }
+
+    if let Some(prev) = request.previous_response_id.as_deref()
+        && let Some(key) = state.sessions().get_by_previous_response_id(prev)
+    {
+        return Ok(key);
+    }
+
+    Ok(crate::session::SessionKey::generate())
+}
+
+async fn finalize_response(
+    state: &AppState,
+    response: Response<Body>,
+    session_key: &crate::session::SessionKey,
+) -> Response<Body> {
+    let header_name = with_config(state.config(), |cfg| cfg.session.header_name.clone());
+    let mut response = response;
+    crate::session::attach_session_header(response.headers_mut(), &header_name, session_key);
+
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !content_type.starts_with("application/json") {
+        return response;
+    }
+
+    if let Some(len) = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        && len > 4 * 1024 * 1024
+    {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let bytes = match to_bytes(body, 4 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return Response::from_parts(parts, Body::empty());
+        }
+    };
+
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
+            state
+                .sessions()
+                .record_response_id(id.to_string(), session_key.clone());
+        }
+    }
+
+    Response::from_parts(parts, Body::from(bytes))
+}
+
+fn is_context_length_error(error: &ProxyError) -> bool {
+    let lower = match error {
+        ProxyError::Provider(msg) => msg.to_ascii_lowercase(),
+        ProxyError::Validation(msg) => msg.to_ascii_lowercase(),
+        ProxyError::Http(err) => err.to_string().to_ascii_lowercase(),
+        ProxyError::Auth(_) => return false,
+        ProxyError::Config(_) => return false,
+        ProxyError::NotImplemented(_) => return false,
+        ProxyError::Internal(_) => return false,
+    };
+    let has_status = lower.contains("(400)") || lower.contains("(413)") || lower.contains(" 413");
+    let has_context = lower.contains("context")
+        || lower.contains("token")
+        || lower.contains("prompt")
+        || lower.contains("maximum")
+        || lower.contains("too long");
+    let has_signal = lower.contains("context length")
+        || lower.contains("maximum context")
+        || lower.contains("prompt is too long")
+        || lower.contains("too many tokens")
+        || lower.contains("token limit")
+        || lower.contains("exceeds")
+        || lower.contains("too large");
+
+    (has_status && has_context) || has_signal
+}
+
+async fn auto_compact_request(
+    state: &AppState,
+    request: &ResponsesRequest,
+    cfg: &crate::config::AutoCompactionConfig,
+    provider_type: crate::config::ProviderType,
+    cache_key_override: Option<u64>,
+    normalized_messages: &[ChatMessage],
+) -> Result<ResponsesRequest, ProxyError> {
+    use crate::schema::openai::{Content, InputItem, ResponsesInput};
+
+    let input = request
+        .input
+        .clone()
+        .ok_or_else(|| ProxyError::Validation("Auto-compaction requires request.input".into()))?;
+    let ResponsesInput::Items(items) = input else {
+        return Err(ProxyError::Validation(
+            "Auto-compaction requires request.input to be an items[] array".into(),
+        ));
+    };
+
+    let tail = cfg.tail_items_to_keep.max(1);
+    if items.len() <= tail {
+        return Err(ProxyError::Provider(
+            "Auto-compaction skipped: not enough input items to compact".into(),
+        ));
+    }
+
+    let prefix_items = items[..items.len() - tail].to_vec();
+    let tail_items = items[items.len() - tail..].to_vec();
+
+    let rewritten_items = match provider_type {
+        crate::config::ProviderType::OpenAi => {
+            let encrypted = run_native_compaction(
+                state,
+                prefix_items,
+                cfg.compact_instructions.clone(),
+                cache_key_override,
+                normalized_messages,
+            )
+            .await?;
+
+            let mut out = Vec::with_capacity(1 + tail_items.len());
+            out.push(InputItem {
+                item_type: "compaction".into(),
+                id: None,
+                call_id: None,
+                role: None,
+                name: None,
+                content: None,
+                reasoning_content: None,
+                thought_signature: None,
+                thought: None,
+                arguments: None,
+                input: None,
+                action: None,
+                command: None,
+                cwd: None,
+                working_directory: None,
+                changes: None,
+                output: None,
+                stdout: None,
+                stderr: None,
+                encrypted_content: Some(encrypted),
+            });
+            out.extend(tail_items);
+            out
+        }
+        _ => {
+            let summary = run_summary_compaction(
+                state,
+                prefix_items,
+                cfg.summary_instructions.clone(),
+                cache_key_override,
+                normalized_messages,
+            )
+            .await?;
+
+            let mut out = Vec::with_capacity(1 + tail_items.len());
+            out.push(InputItem {
+                item_type: "message".into(),
+                id: None,
+                call_id: None,
+                role: Some("system".into()),
+                name: None,
+                content: Some(Content::Text(format!(
+                    "[codex-proxy auto-compaction summary]\n{}",
+                    summary
+                ))),
+                reasoning_content: None,
+                thought_signature: None,
+                thought: None,
+                arguments: None,
+                input: None,
+                action: None,
+                command: None,
+                cwd: None,
+                working_directory: None,
+                changes: None,
+                output: None,
+                stdout: None,
+                stderr: None,
+                encrypted_content: None,
+            });
+            out.extend(tail_items);
+            out
+        }
+    };
+
+    let mut next = request.clone();
+    next.input = Some(ResponsesInput::Items(rewritten_items));
+    next.previous_response_id = None;
+    Ok(next)
+}
+
+async fn run_native_compaction(
+    state: &AppState,
+    prefix_items: Vec<crate::schema::openai::InputItem>,
+    instructions: String,
+    cache_key_override: Option<u64>,
+    normalized_messages: &[ChatMessage],
+) -> Result<String, ProxyError> {
+    use crate::schema::openai::{CompactRequest, Instructions, ResponsesInput};
+
+    let route = resolve_compaction_route(state, normalized_messages, cache_key_override)?;
+    let provider_type = with_config(state.config(), |cfg| cfg.provider_type(&route.provider))
+        .map_err(ProxyError::Config)?;
+    if provider_type != crate::config::ProviderType::OpenAi {
+        return Err(ProxyError::NotImplemented(
+            "Native compaction requires an OpenAI-compatible compaction provider".into(),
+        ));
+    }
+    let provider = crate::providers::get_provider(state, &route.provider);
+    let (account, _) = state
+        .accounts()
+        .get_account(route.account_index)
+        .ok_or_else(|| ProxyError::Internal("Resolved account missing from pool".into()))?;
+    let context = ProviderExecutionContext {
+        route: route.clone(),
+        account,
+        config: state.config().clone(),
+        gemini_auth: state.gemini_auth(),
+    };
+
+    let compact = CompactRequest {
+        input: ResponsesInput::Items(prefix_items),
+        instructions: Instructions::Text(instructions),
+    };
+
+    let resp = provider
+        .handle_compact(compact, HeaderMap::new(), context)
+        .await?;
+    let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .map_err(|e| ProxyError::Internal(format!("Failed to read compaction response: {e}")))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| ProxyError::Provider(e.to_string()))?;
+    find_encrypted_content(&value).ok_or_else(|| {
+        ProxyError::Provider(
+            "Compaction response did not include an encrypted_content artifact".into(),
+        )
+    })
+}
+
+fn find_encrypted_content(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map
+                .get("type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| t == "compaction")
+            {
+                if let Some(enc) = map.get("encrypted_content").and_then(|v| v.as_str()) {
+                    return Some(enc.to_string());
+                }
+            }
+            for v in map.values() {
+                if let Some(found) = find_encrypted_content(v) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => arr.iter().find_map(find_encrypted_content),
+        _ => None,
+    }
+}
+
+async fn run_summary_compaction(
+    state: &AppState,
+    prefix_items: Vec<crate::schema::openai::InputItem>,
+    instructions: String,
+    cache_key_override: Option<u64>,
+    normalized_messages: &[ChatMessage],
+) -> Result<String, ProxyError> {
+    let route = resolve_compaction_route(state, normalized_messages, cache_key_override)?;
+    let provider_type = with_config(state.config(), |cfg| cfg.provider_type(&route.provider))
+        .map_err(ProxyError::Config)?;
+    if provider_type != crate::config::ProviderType::OpenAi {
+        return Err(ProxyError::NotImplemented(
+            "Summary compaction requires an OpenAI-compatible compaction provider".into(),
+        ));
+    }
+    let provider = crate::providers::get_provider(state, &route.provider);
+    let (account, _) = state
+        .accounts()
+        .get_account(route.account_index)
+        .ok_or_else(|| ProxyError::Internal("Resolved account missing from pool".into()))?;
+    let context = ProviderExecutionContext {
+        route: route.clone(),
+        account,
+        config: state.config().clone(),
+        gemini_auth: state.gemini_auth(),
+    };
+
+    let prompt = build_summary_prompt(&prefix_items, &instructions);
+    let raw = ResponsesRequest {
+        model: "__compaction__".into(),
+        input: Some(crate::schema::openai::ResponsesInput::Text(prompt)),
+        instructions: None,
+        previous_response_id: None,
+        store: Some(false),
+        metadata: None,
+        tools: None,
+        tool_choice: None,
+        temperature: Some(0.1),
+        top_p: None,
+        max_tokens: Some(4096),
+        stream: Some(false),
+        include: None,
+    };
+    let normalized = normalizer::normalize(raw.clone());
+    let resp = provider
+        .handle_request(raw, normalized, HeaderMap::new(), context)
+        .await?;
+    let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024)
+        .await
+        .map_err(|e| ProxyError::Internal(format!("Failed to read summary response: {e}")))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| ProxyError::Provider(e.to_string()))?;
+    extract_output_text(&value).ok_or_else(|| {
+        ProxyError::Provider("Summary compaction response did not include output text".into())
+    })
+}
+
+fn build_summary_prompt(
+    prefix_items: &[crate::schema::openai::InputItem],
+    instructions: &str,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(&mut out, "{instructions}");
+    let _ = writeln!(&mut out, "");
+    let _ = writeln!(&mut out, "Conversation:");
+    for item in prefix_items {
+        let role = item.role.as_deref().unwrap_or("unknown");
+        let mut line = String::new();
+        if let Some(content) = &item.content {
+            match content {
+                crate::schema::openai::Content::Text(text) => {
+                    line.push_str(text);
+                }
+                crate::schema::openai::Content::Parts(parts) => {
+                    for part in parts {
+                        if let Some(text) = &part.text {
+                            line.push_str(text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let _ = writeln!(&mut out, "- {role}: {line}");
+    }
+    out
+}
+
+fn extract_output_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.get("output_text").and_then(|v| v.as_str()) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let output = value.get("output")?.as_array()?;
+    for item in output {
+        if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+            let mut parts = String::new();
+            for part in content {
+                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                    parts.push_str(text);
+                }
+            }
+            let trimmed = parts.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod auto_compaction_tests {
+    use super::*;
+
+    #[test]
+    fn detects_context_length_provider_error() {
+        let err = ProxyError::Provider(
+            "OpenAI request failed (400): This model's maximum context length is 128000 tokens"
+                .into(),
+        );
+        assert!(is_context_length_error(&err));
+    }
+
+    #[test]
+    fn finds_encrypted_content_in_nested_shape() {
+        let value = serde_json::json!({
+            "compaction": {
+                "output": [
+                    {"type":"compaction","encrypted_content":"ENC"}
+                ]
+            }
+        });
+        assert_eq!(find_encrypted_content(&value).as_deref(), Some("ENC"));
+    }
+
+    #[test]
+    fn extracts_output_text_from_output_text_field() {
+        let value = serde_json::json!({
+            "output_text": " hello "
+        });
+        assert_eq!(extract_output_text(&value).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn extracts_output_text_from_output_array() {
+        let value = serde_json::json!({
+            "output": [
+                {
+                    "content": [{"type":"output_text","text":"abc"}]
+                }
+            ]
+        });
+        assert_eq!(extract_output_text(&value).as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn builds_summary_prompt_from_message_items() {
+        use crate::schema::openai::{Content, InputItem};
+        let items = vec![
+            InputItem {
+                item_type: "message".into(),
+                id: None,
+                call_id: None,
+                role: Some("user".into()),
+                name: None,
+                content: Some(Content::Text("hi".into())),
+                reasoning_content: None,
+                thought_signature: None,
+                thought: None,
+                arguments: None,
+                input: None,
+                action: None,
+                command: None,
+                cwd: None,
+                working_directory: None,
+                changes: None,
+                output: None,
+                stdout: None,
+                stderr: None,
+                encrypted_content: None,
+            },
+            InputItem {
+                item_type: "message".into(),
+                id: None,
+                call_id: None,
+                role: Some("assistant".into()),
+                name: None,
+                content: Some(Content::Text("hello".into())),
+                reasoning_content: None,
+                thought_signature: None,
+                thought: None,
+                arguments: None,
+                input: None,
+                action: None,
+                command: None,
+                cwd: None,
+                working_directory: None,
+                changes: None,
+                output: None,
+                stdout: None,
+                stderr: None,
+                encrypted_content: None,
+            },
+        ];
+        let prompt = build_summary_prompt(&items, "do a summary");
+        assert!(prompt.contains("do a summary"));
+        assert!(prompt.contains("- user: hi"));
+        assert!(prompt.contains("- assistant: hello"));
+    }
 }
 
 fn record_and_apply_result(
@@ -669,6 +1255,9 @@ async fn api_config_put(
     with_config_mut(state.config(), |cfg| {
         *cfg = next.clone();
     });
+    state
+        .sessions()
+        .set_ttl(Duration::from_secs(next.session.response_id_ttl_seconds));
     state
         .accounts()
         .configure_health(next.routing.health.clone());

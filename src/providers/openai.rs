@@ -438,6 +438,8 @@ mod tests {
             model_discovery: crate::config::ModelDiscoveryConfig::default(),
             model_metadata: crate::config::ProviderModelMetadataConfig::new(),
             models_endpoint: crate::config::ModelsEndpointConfig::default(),
+            session: crate::config::SessionConfig::default(),
+            auto_compaction: crate::config::AutoCompactionConfig::default(),
             routing: RoutingConfig {
                 model_overrides: HashMap::new(),
                 preferred_models: HashMap::new(),

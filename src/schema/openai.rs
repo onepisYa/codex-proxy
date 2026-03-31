@@ -128,6 +128,10 @@ pub struct InputItem {
 
     #[serde(default)]
     pub stderr: Option<String>,
+
+    // OpenAI compaction artifact
+    #[serde(default)]
+    pub encrypted_content: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

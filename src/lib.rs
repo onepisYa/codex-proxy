@@ -8,6 +8,7 @@ pub mod normalizer;
 pub mod providers;
 pub mod schema;
 pub mod server;
+pub mod session;
 pub mod state;
 pub mod ui;
 pub mod usage;

@@ -154,12 +154,14 @@ impl Router {
         state: &RoutingState,
         candidates: &[RouteCandidate],
         messages: &[ChatMessage],
+        cache_key_override: Option<u64>,
     ) -> Option<RoutingDecision> {
         if candidates.is_empty() {
             return None;
         }
 
-        let cache_key = compute_cache_key(&message_signature(messages));
+        let cache_key =
+            cache_key_override.unwrap_or_else(|| compute_cache_key(&message_signature(messages)));
 
         if let Some(binding) = state.sticky_bindings.read().get(&cache_key).cloned() {
             for candidate in candidates {
@@ -235,12 +237,14 @@ impl Router {
         state: &RoutingState,
         candidates: &[RouteCandidate],
         messages: &[ChatMessage],
+        cache_key_override: Option<u64>,
     ) -> Result<ResolvedRoute, ProxyError> {
-        let decision = Self::route(pool, state, candidates, messages).ok_or_else(|| {
-            ProxyError::Provider(
-                "No compatible healthy accounts available for any preferred target".into(),
-            )
-        })?;
+        let decision = Self::route(pool, state, candidates, messages, cache_key_override)
+            .ok_or_else(|| {
+                ProxyError::Provider(
+                    "No compatible healthy accounts available for any preferred target".into(),
+                )
+            })?;
         let candidate = candidates
             .iter()
             .find(|candidate| candidate.priority_index == decision.preferred_target_index)
@@ -303,6 +307,18 @@ mod tests {
         }]
     }
 
+    fn messages_with_text(text: &str) -> Vec<ChatMessage> {
+        vec![ChatMessage {
+            role: "user".into(),
+            content: Some(ChatContent::Text(text.into())),
+            reasoning_content: None,
+            thought_signature: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }]
+    }
+
     fn candidate(priority_index: usize, provider: &str, model: &str) -> RouteCandidate {
         RouteCandidate {
             requested_model: "claude-sonnet-4-6".into(),
@@ -333,6 +349,7 @@ mod tests {
                 candidate(1, "zai", "glm-4.6"),
             ],
             &messages(),
+            None,
         )
         .unwrap();
         assert_eq!(route.provider, "openai");
@@ -350,6 +367,7 @@ mod tests {
             &state,
             &[candidate(0, "openai", "gpt-4.1")],
             &messages(),
+            None,
         )
         .unwrap();
         state.bind_on_success(&first);
@@ -359,9 +377,42 @@ mod tests {
             &state,
             &[candidate(0, "openai", "gpt-4.1")],
             &messages(),
+            None,
         )
         .unwrap();
         assert!(second.cache_hit);
+        assert_eq!(second.account_index, first.account_index);
+    }
+
+    #[test]
+    fn preserves_sticky_binding_with_cache_key_override() {
+        let pool = AccountPool::new();
+        pool.load_accounts(vec![account("openai", "openai", Some(vec!["gpt-4.1"]), 1)]);
+        pool.mark_success(0);
+        let state = RoutingState::new();
+
+        let cache_key_override = Some(42);
+        let first = Router::resolve_route(
+            &pool,
+            &state,
+            &[candidate(0, "openai", "gpt-4.1")],
+            &messages_with_text("hello"),
+            cache_key_override,
+        )
+        .unwrap();
+        state.bind_on_success(&first);
+
+        let second = Router::resolve_route(
+            &pool,
+            &state,
+            &[candidate(0, "openai", "gpt-4.1")],
+            &messages_with_text("different"),
+            cache_key_override,
+        )
+        .unwrap();
+
+        assert!(second.cache_hit);
+        assert_eq!(second.cache_key, 42);
         assert_eq!(second.account_index, first.account_index);
     }
 }
