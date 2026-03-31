@@ -1,10 +1,13 @@
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
+use futures::StreamExt;
 use serde_json::json;
+use std::io;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
@@ -49,6 +52,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/access-keys/{id}", delete(api_access_keys_delete))
         .route("/api/usage/keys", get(api_usage_keys_get))
         .route("/api/usage/accounts", get(api_usage_accounts_get))
+        .route("/api/usage/series", get(api_usage_series_get))
         .route("/api/models", get(api_models_get))
         .route("/v1/responses", post(responses_handler))
         .route("/responses", post(responses_handler))
@@ -368,6 +372,9 @@ async fn responses_handler(
         )));
     }
 
+    let request_bytes = serde_json::to_vec(&data)
+        .map(|v| v.len() as u64)
+        .unwrap_or(0);
     let normalized = normalizer::normalize(data.clone());
     let route = resolve_response_route(&state, &data.model, &normalized.messages)?;
     let provider = crate::providers::get_provider(&state, &route.provider);
@@ -385,7 +392,7 @@ async fn responses_handler(
     let result = provider
         .handle_request(data, normalized, headers, context.clone())
         .await;
-    record_and_apply_result(&state, &access_key, &context, result)
+    record_and_apply_result(&state, &access_key, &context, request_bytes, result)
 }
 
 async fn compact_handler(
@@ -395,6 +402,9 @@ async fn compact_handler(
 ) -> Result<Response<Body>, ProxyError> {
     let access_key = crate::access::authenticate_request(state.config(), &headers)?;
     validator::validate_compact_request(&data)?;
+    let request_bytes = serde_json::to_vec(&data)
+        .map(|v| v.len() as u64)
+        .unwrap_or(0);
 
     let normalized = normalizer::normalize(ResponsesRequest {
         model: "__compaction__".to_string(),
@@ -435,7 +445,7 @@ async fn compact_handler(
     let result = provider
         .handle_compact(data, headers, context.clone())
         .await;
-    record_and_apply_result(&state, &access_key, &context, result)
+    record_and_apply_result(&state, &access_key, &context, request_bytes, result)
 }
 
 fn resolve_response_route(
@@ -509,23 +519,26 @@ fn record_and_apply_result(
     state: &AppState,
     access_key: &Option<AuthenticatedKey>,
     context: &ProviderExecutionContext,
+    request_bytes: u64,
     result: Result<Response<Body>, ProxyError>,
 ) -> Result<Response<Body>, ProxyError> {
     let status = match &result {
         Ok(resp) => resp.status(),
         Err(err) => err.status_code(),
     };
-    state.usage().record_request_result(
+    let usage_handle = state.usage().record_request_start_handle(
         access_key.as_ref().map(|k| k.id.as_str()),
         &context.route.provider,
         &context.route.account_id,
         &context.route.upstream_model,
         status,
         context.route.cache_hit,
+        request_bytes,
     );
 
     match result {
         Ok(response) => {
+            let response = wrap_response_for_usage(state.clone(), usage_handle, response);
             state.accounts().mark_success(context.route.account_index);
             if with_config(state.config(), |cfg| cfg.routing.sticky_routing.enabled) {
                 state.routing().bind_on_success(&context.route);
@@ -540,6 +553,52 @@ fn record_and_apply_result(
             Err(error)
         }
     }
+}
+
+struct UsageResponseTracker {
+    state: AppState,
+    handle: crate::usage::UsageHandle,
+    response_bytes: u64,
+}
+
+impl Drop for UsageResponseTracker {
+    fn drop(&mut self) {
+        self.state
+            .usage()
+            .record_response_bytes(&self.handle, self.response_bytes);
+    }
+}
+
+fn wrap_response_for_usage(
+    state: AppState,
+    handle: crate::usage::UsageHandle,
+    response: Response<Body>,
+) -> Response<Body> {
+    let (parts, body) = response.into_parts();
+    let mut tracker = UsageResponseTracker {
+        state,
+        handle,
+        response_bytes: 0,
+    };
+
+    let mut data_stream = body.into_data_stream();
+    let stream = async_stream::stream! {
+        while let Some(chunk) = data_stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    tracker.response_bytes += bytes.len() as u64;
+                    yield Ok::<Bytes, io::Error>(bytes);
+                }
+                Err(err) => {
+                    yield Err(io::Error::new(io::ErrorKind::Other, err.to_string()));
+                    break;
+                }
+            }
+        }
+        drop(tracker);
+    };
+
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 fn is_auth_failure(error: &ProxyError) -> bool {
@@ -648,6 +707,44 @@ async fn api_usage_accounts_get(
     Ok(Json(
         json!({ "accounts": state.usage().snapshot_accounts() }),
     ))
+}
+
+#[derive(serde::Deserialize)]
+struct UsageSeriesQuery {
+    #[serde(default)]
+    bucket_seconds: Option<u64>,
+    #[serde(default)]
+    window_seconds: Option<u64>,
+}
+
+async fn api_usage_series_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UsageSeriesQuery>,
+) -> Result<Json<serde_json::Value>, ProxyError> {
+    authenticate_admin(&state, &headers)?;
+
+    let bucket_seconds = query.bucket_seconds.unwrap_or(300);
+    if bucket_seconds == 0 || bucket_seconds % 60 != 0 {
+        return Err(ProxyError::Validation(
+            "bucket_seconds must be a positive multiple of 60".into(),
+        ));
+    }
+    let window_seconds = query.window_seconds.unwrap_or(24 * 60 * 60);
+    if window_seconds == 0 {
+        return Err(ProxyError::Validation(
+            "window_seconds must be positive".into(),
+        ));
+    }
+
+    let buckets = state
+        .usage()
+        .snapshot_series(bucket_seconds, window_seconds);
+    Ok(Json(json!({
+        "bucket_seconds": bucket_seconds,
+        "window_seconds": window_seconds,
+        "buckets": buckets,
+    })))
 }
 
 #[derive(serde::Deserialize)]
