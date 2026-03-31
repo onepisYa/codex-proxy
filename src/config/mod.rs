@@ -407,6 +407,8 @@ pub struct AccessControlConfig {
     pub require_key: bool,
     #[serde(default)]
     pub keys: Vec<AccessKeyConfig>,
+    #[serde(default)]
+    pub bootstrap_admin_key: Option<String>,
 }
 
 impl Default for AccessControlConfig {
@@ -414,6 +416,7 @@ impl Default for AccessControlConfig {
         Self {
             require_key: false,
             keys: Vec::new(),
+            bootstrap_admin_key: None,
         }
     }
 }

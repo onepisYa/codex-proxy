@@ -15,10 +15,20 @@ pub fn authenticate_request(
     config: &ConfigHandle,
     headers: &HeaderMap,
 ) -> Result<Option<AuthenticatedKey>, ProxyError> {
-    let (require_key, keys) = with_config(config, |cfg| {
-        (cfg.access.require_key, cfg.access.keys.clone())
+    let (require_key, keys, bootstrap_admin_key) = with_config(config, |cfg| {
+        (
+            cfg.access.require_key,
+            cfg.access.keys.clone(),
+            cfg.access.bootstrap_admin_key.clone(),
+        )
     });
-    if !require_key && keys.is_empty() {
+    let has_bootstrap_key = bootstrap_admin_key
+        .as_ref()
+        .is_some_and(|v| !v.trim().is_empty())
+        || std::env::var("CODEX_PROXY_BOOTSTRAP_ADMIN_KEY")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty());
+    if !require_key && keys.is_empty() && !has_bootstrap_key {
         return Ok(None);
     }
 
@@ -32,7 +42,18 @@ pub fn authenticate_request(
         return Ok(None);
     };
 
-    if let Ok(bootstrap) = std::env::var("CODEX_PROXY_BOOTSTRAP_ADMIN_KEY")
+    if let Some(bootstrap) = bootstrap_admin_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        if presented == bootstrap {
+            return Ok(Some(AuthenticatedKey {
+                id: "bootstrap".into(),
+                is_admin: true,
+            }));
+        }
+    } else if let Ok(bootstrap) = std::env::var("CODEX_PROXY_BOOTSTRAP_ADMIN_KEY")
         && !bootstrap.is_empty()
         && presented == bootstrap
     {

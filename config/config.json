@@ -22,13 +22,13 @@
       "models": []
     },
     "openai": {
-      "type": "openai",
+      "type": "open_ai",
       "endpoints": {},
       "models": [],
       "api_url": "https://api.openai.com/v1/responses"
     },
     "tabcode": {
-      "type": "openai",
+      "type": "open_ai",
       "api_url": "https://api2.tabcode.cc/openai/v1/responses",
       "endpoints": {},
       "models": []

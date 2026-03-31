@@ -1,19 +1,16 @@
 use axum::body::Body;
 use axum::http::{HeaderMap, header};
-use axum::response::{IntoResponse, Response};
-use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use axum::response::Response;
+use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::gemini_utils::{
-    GeminiContent, GeminiPart, GeminiSystemInstruction, map_messages, sanitize_params,
-};
+use super::gemini_utils::{GeminiContent, GeminiSystemInstruction, map_messages, sanitize_params};
 use crate::auth::AuthType;
 use crate::config::with_config;
 use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::json_value::JsonValue;
-use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
+use crate::schema::openai::{ChatRequest, ResponsesRequest};
 
 pub struct GeminiProvider {
     client: reqwest::Client,
@@ -182,173 +179,6 @@ impl GeminiProvider {
             .body(body)
             .unwrap())
     }
-
-    async fn handle_compact_impl(
-        &self,
-        data: &CompactRequest,
-        context: &ProviderExecutionContext,
-    ) -> Result<Response<Body>, ProxyError> {
-        let auth_ctx = context
-            .gemini_auth
-            .get_auth_context(&context.account, false)
-            .await?;
-        let compaction_model = context.upstream_model();
-
-        let chat_req = crate::normalizer::normalize(ResponsesRequest {
-            model: compaction_model.to_string(),
-            input: Some(data.input.clone()),
-            instructions: None,
-            previous_response_id: None,
-            store: None,
-            metadata: None,
-            tools: None,
-            tool_choice: None,
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-            stream: None,
-            include: None,
-        });
-
-        let (mut contents, system_instruction) = map_messages(&chat_req.messages, compaction_model);
-        let compaction_prompt = instructions_to_text(&data.instructions);
-        let compaction_prompt = if compaction_prompt.is_empty() {
-            "Summarize the conversation history concisely.".to_string()
-        } else {
-            compaction_prompt
-        };
-        contents.push(GeminiContent {
-            role: "user".into(),
-            parts: vec![GeminiPart {
-                text: Some(format!(
-                    "Perform context compaction. instructions: {compaction_prompt}"
-                )),
-                thought: None,
-                function_call: None,
-                function_response: None,
-                thought_signature: None,
-            }],
-        });
-
-        let body = GeminiRequestBody {
-            contents,
-            generation_config: GeminiGenerationConfig {
-                temperature: with_config(&context.config, |cfg| cfg.compaction.temperature),
-                top_p: 1.0,
-                max_output_tokens: Some(4096),
-                thinking_config: context.reasoning().and_then(|rc| {
-                    (rc.budget > 0).then_some(GeminiThinkingConfig {
-                        thinking_budget: rc.budget,
-                        include_thoughts: true,
-                    })
-                }),
-            },
-            system_instruction,
-            tools: None,
-            tool_config: None,
-        };
-
-        let provider_config = with_config(&context.config, |cfg| {
-            cfg.gemini_provider_config(context.provider())
-        })
-        .map_err(ProxyError::Config)?;
-        let (url, req_headers, send_body) = match &auth_ctx.auth_type {
-            AuthType::Public => {
-                let key = auth_ctx.api_key.as_ref().unwrap();
-                (
-                    format!(
-                        "{}/v1beta/models/{compaction_model}:streamGenerateContent?alt=sse&key={key}",
-                        provider_config.api_public
-                    ),
-                    header::HeaderMap::new(),
-                    GeminiSendBody::Public(body),
-                )
-            }
-            AuthType::Internal => {
-                let token = auth_ctx.access_token.as_ref().unwrap();
-                let pid = auth_ctx.project_id.as_ref().unwrap();
-                let mut h = header::HeaderMap::new();
-                h.insert("Authorization", format!("Bearer {token}").parse().unwrap());
-                (
-                    format!(
-                        "{}/v1internal:streamGenerateContent?alt=sse",
-                        provider_config.api_internal
-                    ),
-                    h,
-                    GeminiSendBody::Internal(GeminiInternalBody {
-                        model: compaction_model.to_string(),
-                        project: pid.clone(),
-                        request: body,
-                    }),
-                )
-            }
-        };
-
-        let resp = self
-            .client
-            .post(&url)
-            .headers(req_headers)
-            .json(&send_body)
-            .timeout(std::time::Duration::from_secs(with_config(
-                &context.config,
-                |cfg| cfg.timeouts.read_seconds,
-            )))
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
-            {
-                return Err(ProxyError::Auth(format!(
-                    "Gemini compaction unauthorized ({}): {}",
-                    status, body
-                )));
-            }
-            return Err(ProxyError::Provider(format!(
-                "Compaction error ({}): {}",
-                status, body
-            )));
-        }
-
-        let mut final_text = String::new();
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(ProxyError::Http)?;
-            let text = String::from_utf8_lossy(&chunk);
-            for line in text.lines() {
-                if !line.starts_with("data: ") {
-                    continue;
-                }
-                let data_str = &line[6..];
-                let chunk: GeminiChunk = match serde_json::from_str(data_str) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-                let resp_part = chunk.response();
-                let cand = match resp_part.candidates.first() {
-                    Some(c) => c,
-                    None => continue,
-                };
-                let parts = match cand.content.as_ref() {
-                    Some(c) => c.parts.as_slice(),
-                    None => continue,
-                };
-                for p in parts {
-                    if let Some(t) = p.text.as_deref() {
-                        final_text.push_str(t);
-                    }
-                }
-            }
-        }
-
-        Ok(axum::Json(CompactResponse {
-            summary_text: final_text,
-        })
-        .into_response())
-    }
 }
 
 impl Provider for GeminiProvider {
@@ -362,17 +192,6 @@ impl Provider for GeminiProvider {
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
         Box::pin(async move { self.execute_stream(&normalized_request, &context).await })
-    }
-
-    fn handle_compact(
-        &self,
-        data: CompactRequest,
-        _headers: HeaderMap,
-        context: ProviderExecutionContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
-    > {
-        Box::pin(async move { self.handle_compact_impl(&data, &context).await })
     }
 
     fn probe_account(
@@ -414,11 +233,6 @@ impl Provider for GeminiProvider {
             client: self.client.clone(),
         })
     }
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct CompactResponse {
-    summary_text: String,
 }
 
 #[derive(Clone, Debug)]
@@ -499,13 +313,6 @@ struct GeminiInternalBody {
     request: GeminiRequestBody,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(untagged)]
-enum GeminiSendBody {
-    Public(GeminiRequestBody),
-    Internal(GeminiInternalBody),
-}
-
 fn apply_tools(req_data: &ChatRequest) -> (Option<Vec<GeminiTool>>, Option<GeminiToolConfig>) {
     let mut tool_decls: Vec<GeminiFunctionDeclaration> = Vec::new();
     for t in &req_data.tools {
@@ -563,63 +370,9 @@ fn apply_tools(req_data: &ChatRequest) -> (Option<Vec<GeminiTool>>, Option<Gemin
     (tools_opt, tool_config)
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(untagged)]
-enum GeminiChunk {
-    Wrapped { response: GeminiResponse },
-    Direct(GeminiResponse),
-}
-
-impl GeminiChunk {
-    fn response(&self) -> &GeminiResponse {
-        match self {
-            GeminiChunk::Wrapped { response } => response,
-            GeminiChunk::Direct(r) => r,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct GeminiResponse {
-    #[serde(default)]
-    candidates: Vec<GeminiCandidate>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct GeminiCandidate {
-    #[serde(default)]
-    content: Option<GeminiCandidateContent>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct GeminiCandidateContent {
-    #[serde(default)]
-    parts: Vec<GeminiPartResp>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct GeminiPartResp {
-    #[serde(default)]
-    text: Option<String>,
-}
-
 fn now_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-fn instructions_to_text(i: &crate::schema::openai::Instructions) -> String {
-    match i {
-        crate::schema::openai::Instructions::Text(s) => s.clone(),
-        crate::schema::openai::Instructions::Parts(parts) => parts
-            .iter()
-            .map(|p| match p {
-                crate::schema::openai::TextPart::Text(s) => s.clone(),
-                crate::schema::openai::TextPart::Obj { text } => text.clone(),
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-    }
 }

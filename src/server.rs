@@ -44,7 +44,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/access-keys",
             get(api_access_keys_get).post(api_access_keys_create),
         )
-        .route("/api/access-keys/:id", delete(api_access_keys_delete))
+        .route("/api/access-keys/{id}", delete(api_access_keys_delete))
         .route("/api/usage/keys", get(api_usage_keys_get))
         .route("/api/usage/accounts", get(api_usage_accounts_get))
         .route("/v1/responses", post(responses_handler))
@@ -220,6 +220,14 @@ async fn compact_handler(
         include: None,
     });
     let route = resolve_compaction_route(&state, &normalized.messages)?;
+    let provider_type = with_config(state.config(), |cfg| cfg.provider_type(&route.provider))
+        .map_err(ProxyError::Config)?;
+    if provider_type != crate::config::ProviderType::OpenAi {
+        return Err(ProxyError::NotImplemented(format!(
+            "Compaction is only supported for OpenAI-compatible providers; resolved provider '{}' does not support native compaction",
+            route.provider
+        )));
+    }
     let provider = crate::providers::get_provider(&state, &route.provider);
     let (account, _) = state
         .accounts()
@@ -390,6 +398,24 @@ async fn api_config_get(
                     }
                 }
             }
+        }
+    }
+    if let Some(access) = value.get_mut("access").and_then(|v| v.as_object_mut()) {
+        if let Some(token) = access
+            .get("bootstrap_admin_key")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            let masked = if token.len() <= 8 {
+                "***".to_string()
+            } else {
+                format!("{}...{}", &token[..4], &token[token.len() - 4..])
+            };
+            access.insert(
+                "bootstrap_admin_key".to_string(),
+                serde_json::Value::String(masked),
+            );
         }
     }
     Ok(Json(json!({ "config_path": config_path, "config": value })))

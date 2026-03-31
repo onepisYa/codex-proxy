@@ -36,8 +36,24 @@ impl OpenAiProvider {
         .map_err(ProxyError::Config)
     }
 
-    async fn send_json(
+    fn resolve_compact_endpoint_url(
         &self,
+        context: &ProviderExecutionContext,
+    ) -> Result<String, ProxyError> {
+        let url = self.resolve_endpoint_url(context)?;
+        let trimmed = url.trim_end_matches('/');
+        if trimmed.ends_with("/compact") {
+            return Ok(trimmed.to_string());
+        }
+        if trimmed.ends_with("/responses") || trimmed.ends_with("/v1/responses") {
+            return Ok(format!("{trimmed}/compact"));
+        }
+        Ok(url)
+    }
+
+    async fn send_json_to(
+        &self,
+        endpoint_url: &str,
         payload: Value,
         mut headers: HeaderMap,
         context: &ProviderExecutionContext,
@@ -60,8 +76,6 @@ impl OpenAiProvider {
             })?,
         );
 
-        let endpoint_url = self.resolve_endpoint_url(context)?;
-
         self.client
             .post(endpoint_url)
             .headers(headers)
@@ -73,6 +87,59 @@ impl OpenAiProvider {
             .send()
             .await
             .map_err(ProxyError::Http)
+    }
+
+    async fn send_json(
+        &self,
+        payload: Value,
+        headers: HeaderMap,
+        context: &ProviderExecutionContext,
+    ) -> Result<reqwest::Response, ProxyError> {
+        let endpoint_url = self.resolve_endpoint_url(context)?;
+        self.send_json_to(&endpoint_url, payload, headers, context)
+            .await
+    }
+
+    async fn forward_json_to(
+        &self,
+        endpoint_url: &str,
+        payload: Value,
+        headers: HeaderMap,
+        context: &ProviderExecutionContext,
+    ) -> Result<Response<Body>, ProxyError> {
+        let response = self
+            .send_json_to(endpoint_url, payload, headers, context)
+            .await?;
+
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        let bytes = response.bytes().await?;
+
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(ProxyError::Auth(format!(
+                "OpenAI request unauthorized ({}): {}",
+                status,
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        if !status.is_success() {
+            return Err(ProxyError::Provider(format!(
+                "OpenAI request failed ({}): {}",
+                status,
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+
+        let mut builder = Response::builder().status(status);
+        for (name, value) in &response_headers {
+            if name.as_str().eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            builder = builder.header(name, value);
+        }
+        builder
+            .body(Body::from(bytes))
+            .map_err(|e| ProxyError::Internal(format!("Failed to build OpenAI response: {e}")))
     }
 
     async fn forward_json(
@@ -149,7 +216,11 @@ impl Provider for OpenAiProvider {
             "stream": false
         });
         apply_openai_route_overrides(&mut payload, &context);
-        Box::pin(async move { self.forward_json(payload, headers, &context).await })
+        Box::pin(async move {
+            let endpoint_url = self.resolve_compact_endpoint_url(&context)?;
+            self.forward_json_to(&endpoint_url, payload, headers, &context)
+                .await
+        })
     }
 
     fn probe_account(

@@ -10,6 +10,9 @@ pub enum ProxyError {
     #[error("Provider error: {0}")]
     Provider(String),
 
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
+
     #[error("Authentication error: {0}")]
     Auth(String),
 
@@ -74,6 +77,7 @@ impl ProxyError {
         match self {
             ProxyError::Validation(_) => StatusCode::BAD_REQUEST,
             ProxyError::Provider(_) => StatusCode::BAD_GATEWAY,
+            ProxyError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             ProxyError::Auth(_) => StatusCode::UNAUTHORIZED,
             ProxyError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ProxyError::Http(e) => e
@@ -88,6 +92,7 @@ impl ProxyError {
         match self {
             ProxyError::Validation(_) => "bad_request",
             ProxyError::Provider(_) => "provider_error",
+            ProxyError::NotImplemented(_) => "not_implemented",
             ProxyError::Auth(_) => "auth_error",
             ProxyError::Config(_) => "config_error",
             ProxyError::Http(_) => "http_error",

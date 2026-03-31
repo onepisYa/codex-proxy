@@ -11,7 +11,7 @@ use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::json_value::JsonValue;
 use crate::schema::openai::{
-    ChatContent, ChatMessage, ChatRequest, CompactRequest, ResponsesRequest, Tool, ToolCall,
+    ChatContent, ChatMessage, ChatRequest, ResponsesRequest, Tool, ToolCall,
 };
 use crate::schema::sse::{
     FunctionCallItem, LocalShellCallItem, MessageItem, OutputContentPart, OutputItem,
@@ -134,107 +134,6 @@ impl ZAIProvider {
         let out = map_zai_response_to_responses_api(&z_data);
         Ok(axum::Json(out).into_response())
     }
-
-    async fn handle_compact_impl(
-        &self,
-        data: &CompactRequest,
-        headers: HeaderMap,
-        context: &ProviderExecutionContext,
-    ) -> Result<Response<Body>, ProxyError> {
-        let compaction_model = context.upstream_model();
-
-        let mut messages = match &data.input {
-            crate::schema::openai::ResponsesInput::Text(s) => vec![ZaiMessage {
-                role: "user".into(),
-                content: Some(s.clone()),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            }],
-            crate::schema::openai::ResponsesInput::Items(items) => {
-                crate::normalizer::normalize(ResponsesRequest {
-                    model: compaction_model.to_string(),
-                    input: Some(crate::schema::openai::ResponsesInput::Items(items.clone())),
-                    instructions: None,
-                    previous_response_id: None,
-                    store: None,
-                    metadata: None,
-                    tools: None,
-                    tool_choice: None,
-                    temperature: None,
-                    top_p: None,
-                    max_tokens: None,
-                    stream: None,
-                    include: None,
-                })
-                .messages
-                .into_iter()
-                .map(|m| to_zai_message(&m))
-                .collect::<Vec<_>>()
-            }
-        };
-
-        let compaction_prompt = instructions_to_text(&data.instructions);
-        let compaction_prompt = if compaction_prompt.is_empty() {
-            "Summarize the conversation history concisely.".to_string()
-        } else {
-            compaction_prompt
-        };
-        messages.push(ZaiMessage {
-            role: "user".into(),
-            content: Some(format!(
-                "Perform context compaction. instructions: {compaction_prompt}"
-            )),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        });
-
-        let payload = ZaiChatRequest {
-            model: compaction_model.to_string(),
-            messages,
-            stream: false,
-            tools: None,
-            tool_choice: None,
-            temperature: Some(with_config(&context.config, |cfg| {
-                cfg.compaction.temperature
-            })),
-            top_p: None,
-            max_tokens: Some(4096),
-            thinking: context.reasoning().map(zai_thinking_config),
-        };
-
-        let auth = resolve_zai_auth(headers, context)?;
-        let resp = self.post_json(&payload, auth, context).await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
-            {
-                return Err(ProxyError::Auth(format!(
-                    "Z.AI compaction unauthorized ({}). Body: {}",
-                    status, body
-                )));
-            }
-            return Err(ProxyError::Provider(format!(
-                "Z.AI compaction failed ({}): {}",
-                status, body
-            )));
-        }
-        let z_data: ZaiChatResponse = resp.json().await?;
-        let final_text = z_data
-            .choices
-            .first()
-            .and_then(|c| c.message.as_ref())
-            .and_then(|m| m.content.as_deref())
-            .unwrap_or("")
-            .to_string();
-        Ok(axum::Json(CompactResponse {
-            summary_text: final_text,
-        })
-        .into_response())
-    }
 }
 
 impl Provider for ZAIProvider {
@@ -248,17 +147,6 @@ impl Provider for ZAIProvider {
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
         Box::pin(async move { self.execute_request(&data, headers, &context).await })
-    }
-
-    fn handle_compact(
-        &self,
-        data: CompactRequest,
-        headers: HeaderMap,
-        context: ProviderExecutionContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
-    > {
-        Box::pin(async move { self.handle_compact_impl(&data, headers, &context).await })
     }
 
     fn probe_account(
@@ -311,11 +199,6 @@ impl Provider for ZAIProvider {
             client: self.client.clone(),
         })
     }
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct CompactResponse {
-    summary_text: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -443,20 +326,6 @@ fn chat_content_to_string(c: &ChatContent) -> String {
         ChatContent::Parts(parts) => parts
             .iter()
             .map(|p| p.text.clone().unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join(""),
-    }
-}
-
-fn instructions_to_text(i: &crate::schema::openai::Instructions) -> String {
-    match i {
-        crate::schema::openai::Instructions::Text(s) => s.clone(),
-        crate::schema::openai::Instructions::Parts(parts) => parts
-            .iter()
-            .map(|p| match p {
-                crate::schema::openai::TextPart::Text(s) => s.clone(),
-                crate::schema::openai::TextPart::Obj { text } => text.clone(),
-            })
             .collect::<Vec<_>>()
             .join(""),
     }

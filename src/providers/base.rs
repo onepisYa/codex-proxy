@@ -59,7 +59,7 @@ pub trait Provider: Send + Sync {
     > {
         Box::pin(async move {
             let _ = (data, headers, context);
-            Err(ProxyError::Provider(
+            Err(ProxyError::NotImplemented(
                 "Compaction not implemented for this provider".into(),
             ))
         })

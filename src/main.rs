@@ -24,12 +24,22 @@ async fn main() {
     let addr = with_config(&config_handle, |cfg| {
         format!("{}:{}", cfg.server.host, cfg.server.port)
     });
+    let (ui_host, ui_port) = with_config(&config_handle, |cfg| {
+        let host = if cfg.server.host == "0.0.0.0" {
+            "127.0.0.1".to_string()
+        } else {
+            cfg.server.host.clone()
+        };
+        (host, cfg.server.port)
+    });
     let state = AppState::new(config_handle.clone());
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("Failed to bind");
     info!("Server bound to {addr}");
+    info!("UI: http://{}:{}/ui", ui_host, ui_port);
+    info!("Config snapshot: http://{}:{}/config", ui_host, ui_port);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
