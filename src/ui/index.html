@@ -41,6 +41,9 @@
             if (k === "class") node.className = v;
             else if (k === "text") node.textContent = v;
             else if (k === "html") node.innerHTML = v;
+            else if (k === "value") node.value = v;
+            else if (k === "checked") node.checked = !!v;
+            else if (k === "disabled") node.disabled = !!v;
             else if (k.startsWith("on") && typeof v === "function") {
               node.addEventListener(k.slice(2), v);
             } else if (v === true) node.setAttribute(k, "");
@@ -153,7 +156,7 @@
               el("input", {
                 class:
                   "w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 md:w-96",
-                placeholder: "Admin access key (x-codex-proxy-key)",
+                placeholder: "Access key (x-codex-proxy-key)",
                 value: state.adminKey,
                 oninput: (e) => {
                   state.adminKey = e.currentTarget.value;
@@ -314,7 +317,7 @@
               "tr",
               null,
               tdMono(k.id),
-              el("td", { class: "px-3 py-2", text: k.is_admin ? "yes" : "no" }),
+              el("td", { class: "px-3 py-2", text: k.role || "" }),
               el("td", { class: "px-3 py-2", text: k.enabled ? "yes" : "no" }),
               el("td", { class: "px-3 py-2", text: k.name || "" }),
               el("td", { class: "px-3 py-2 font-mono text-xs", text: k.key_sha256 || "" }),
@@ -357,15 +360,16 @@
                     value: state.newKeyName,
                     oninput: (e) => (state.newKeyName = e.currentTarget.value),
                   }),
+                  el("label", { class: "mt-2 text-xs text-slate-400", text: "Role" }),
                   el(
-                    "label",
-                    { class: "mt-2 flex items-center gap-2" },
-                    el("input", {
-                      type: "checkbox",
-                      checked: state.newKeyAdmin ? true : null,
-                      onchange: (e) => (state.newKeyAdmin = e.currentTarget.checked),
-                    }),
-                    el("span", { text: "Admin" })
+                    "select",
+                    {
+                      class: "rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm",
+                      value: state.newKeyRole,
+                      onchange: (e) => (state.newKeyRole = e.currentTarget.value),
+                    },
+                    el("option", { value: "api", text: "api" }),
+                    el("option", { value: "admin", text: "admin" })
                   ),
                   el(
                     "label",
@@ -402,7 +406,7 @@
                     el(
                       "thead",
                       { class: "text-left text-xs text-slate-400" },
-                      el("tr", null, th("ID"), th("Admin"), th("Enabled"), th("Name"), th("Key SHA256"), th(""))
+                      el("tr", null, th("ID"), th("Role"), th("Enabled"), th("Name"), th("Key SHA256"), th(""))
                     ),
                     el("tbody", { class: "divide-y divide-slate-800" }, keysRows)
                   )
@@ -480,7 +484,7 @@
         state.error = "";
         renderApp(root, state);
         if (!(state.adminKey || "").trim()) {
-          state.error = "Admin access key required.";
+          state.error = "Access key required.";
           state.busy = false;
           renderApp(root, state);
           return;
@@ -534,13 +538,13 @@
           const resp = await apiJson(state, "POST", "/api/access-keys", {
             id: (state.newKeyId || "").trim() || null,
             name: (state.newKeyName || "").trim() || null,
-            is_admin: !!state.newKeyAdmin,
+            role: state.newKeyRole || "api",
             enabled: !!state.newKeyEnabled,
           });
           state.createdKey = resp || null;
           state.newKeyId = "";
           state.newKeyName = "";
-          state.newKeyAdmin = false;
+          state.newKeyRole = "api";
           state.newKeyEnabled = true;
           const keys = await apiGet(state, "/api/access-keys");
           state.accessKeys = keys.keys || [];
@@ -588,7 +592,7 @@
         usageAccounts: [],
         newKeyId: "",
         newKeyName: "",
-        newKeyAdmin: false,
+        newKeyRole: "api",
         newKeyEnabled: true,
       };
 

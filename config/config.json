@@ -51,6 +51,10 @@
     }
   },
   "accounts": [],
+  "access": {
+    "require_key": false,
+    "keys": []
+  },
   "reasoning": {
     "effort_levels": {
       "none": {

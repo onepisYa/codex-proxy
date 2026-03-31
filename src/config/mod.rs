@@ -389,6 +389,13 @@ pub struct CompactionConfig {
     pub preferred_targets: Vec<RouteTargetConfig>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessKeyRole {
+    Admin,
+    Api,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessKeyConfig {
     pub id: String,
@@ -398,7 +405,21 @@ pub struct AccessKeyConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
+    pub role: Option<AccessKeyRole>,
+    #[serde(default, skip_serializing)]
     pub is_admin: bool,
+}
+
+impl AccessKeyConfig {
+    pub fn effective_role(&self) -> AccessKeyRole {
+        self.role.unwrap_or_else(|| {
+            if self.is_admin {
+                AccessKeyRole::Admin
+            } else {
+                AccessKeyRole::Api
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,8 +428,6 @@ pub struct AccessControlConfig {
     pub require_key: bool,
     #[serde(default)]
     pub keys: Vec<AccessKeyConfig>,
-    #[serde(default)]
-    pub bootstrap_admin_key: Option<String>,
 }
 
 impl Default for AccessControlConfig {
@@ -416,7 +435,6 @@ impl Default for AccessControlConfig {
         Self {
             require_key: false,
             keys: Vec::new(),
-            bootstrap_admin_key: None,
         }
     }
 }
@@ -522,7 +540,12 @@ impl Default for Config {
 impl Config {
     pub fn new() -> Self {
         let mut cfg = Self::defaults();
-        cfg.load_from_file();
+        let loaded = cfg.load_from_file();
+        if !loaded {
+            panic!(
+                "No config file found. Refusing to start without an explicit config that includes an 'access' section."
+            );
+        }
         cfg.validate().expect("invalid configuration");
         cfg
     }
@@ -679,7 +702,7 @@ impl Config {
         }
     }
 
-    fn load_from_file(&mut self) {
+    fn load_from_file(&mut self) -> bool {
         for path in default_config_search_paths(&dirs_home()) {
             if !path.exists() {
                 continue;
@@ -698,6 +721,12 @@ impl Config {
                     continue;
                 }
             };
+            if file_cfg.access.is_none() {
+                panic!(
+                    "Config {} is missing required 'access' section. Refusing to start.",
+                    path.display()
+                );
+            }
 
             if let Some(server) = file_cfg.server {
                 self.server = server;
@@ -729,8 +758,9 @@ impl Config {
 
             self.config_path = path.clone();
             info!("Loaded config from {}", self.config_path.display());
-            return;
+            return true;
         }
+        false
     }
 
     pub fn to_persisted(&self) -> PersistedConfig {

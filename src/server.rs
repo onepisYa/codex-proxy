@@ -388,24 +388,6 @@ async fn api_config_get(
             }
         }
     }
-    if let Some(access) = value.get_mut("access").and_then(|v| v.as_object_mut()) {
-        if let Some(token) = access
-            .get("bootstrap_admin_key")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            let masked = if token.len() <= 8 {
-                "***".to_string()
-            } else {
-                format!("{}...{}", &token[..4], &token[token.len() - 4..])
-            };
-            access.insert(
-                "bootstrap_admin_key".to_string(),
-                serde_json::Value::String(masked),
-            );
-        }
-    }
     Ok(Json(json!({ "config_path": config_path, "config": value })))
 }
 
@@ -473,7 +455,7 @@ struct AccessKeyCreateRequest {
     #[serde(default)]
     pub enabled: Option<bool>,
     #[serde(default)]
-    pub is_admin: Option<bool>,
+    pub role: Option<crate::config::AccessKeyRole>,
 }
 
 async fn api_access_keys_get(
@@ -498,7 +480,7 @@ async fn api_access_keys_create(
         .id
         .unwrap_or_else(|| format!("key-{}", sha[..12].to_string()));
     let enabled = req.enabled.unwrap_or(true);
-    let is_admin = req.is_admin.unwrap_or(false);
+    let role = req.role.unwrap_or(crate::config::AccessKeyRole::Api);
     let name = req.name;
 
     let config_path = with_config(state.config(), |cfg| cfg.config_path.clone());
@@ -511,17 +493,23 @@ async fn api_access_keys_create(
         }
         cfg.access.keys.push(crate::config::AccessKeyConfig {
             id: key_id.clone(),
-            key_sha256: sha,
+            key_sha256: sha.clone(),
             name,
             enabled,
-            is_admin,
+            role: Some(role),
+            is_admin: false,
         });
         cfg.validate().map_err(ProxyError::Config)?;
         Ok(cfg.clone())
     })?;
     next.save_to_path(&config_path)
         .map_err(ProxyError::Config)?;
-    Ok(Json(json!({ "id": key_id, "key": plaintext })))
+    Ok(Json(json!({
+        "id": key_id,
+        "plaintext": plaintext,
+        "key_sha256": sha,
+        "role": role,
+    })))
 }
 
 async fn api_access_keys_delete(
