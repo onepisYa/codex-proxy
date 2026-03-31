@@ -211,6 +211,8 @@ oauth_creds.json
 secrets.json
 /reference/
 
+# Playwright CLI artifacts
+.playwright-cli/
 
 # Added by cargo
 

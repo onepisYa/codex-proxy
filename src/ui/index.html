@@ -10,10 +10,14 @@
     <div id="app"></div>
 
     <script type="module">
-      import { createEffect, createMemo, createSignal, For, Show } from "https://esm.sh/solid-js@1.8.15";
-      import { render } from "https://esm.sh/solid-js@1.8.15/web";
-
       const STORAGE_KEY = "codex-proxy:admin_key";
+      const TABS = [
+        ["overview", "Overview"],
+        ["accounts", "Accounts"],
+        ["keys", "Access Keys"],
+        ["usage", "Usage"],
+        ["config", "Config"],
+      ];
 
       function jsonPretty(value) {
         return JSON.stringify(value, null, 2);
@@ -23,446 +27,573 @@
         if (!err) return "unknown error";
         if (typeof err === "string") return err;
         if (err.message) return err.message;
-        try { return JSON.stringify(err); } catch { return String(err); }
+        try {
+          return JSON.stringify(err);
+        } catch {
+          return String(err);
+        }
       }
 
-      function App() {
-        const [adminKey, setAdminKey] = createSignal(localStorage.getItem(STORAGE_KEY) || "");
-        const [tab, setTab] = createSignal("overview");
-        const [error, setError] = createSignal("");
-        const [busy, setBusy] = createSignal(false);
+      function el(tag, attrs, ...children) {
+        const node = document.createElement(tag);
+        if (attrs) {
+          for (const [k, v] of Object.entries(attrs)) {
+            if (k === "class") node.className = v;
+            else if (k === "text") node.textContent = v;
+            else if (k === "html") node.innerHTML = v;
+            else if (k.startsWith("on") && typeof v === "function") {
+              node.addEventListener(k.slice(2), v);
+            } else if (v === true) node.setAttribute(k, "");
+            else if (v !== false && v != null) node.setAttribute(k, String(v));
+          }
+        }
+        for (const c of children.flat()) {
+          if (c == null) continue;
+          if (typeof c === "string") node.appendChild(document.createTextNode(c));
+          else node.appendChild(c);
+        }
+        return node;
+      }
 
-        const headers = createMemo(() => {
-          const h = { "content-type": "application/json" };
-          const key = adminKey().trim();
-          if (key) h["x-codex-proxy-key"] = key;
-          return h;
+      function badge(ok, onText = "yes", offText = "no") {
+        const text = ok ? onText : offText;
+        const cls = ok
+          ? "bg-emerald-500/20 text-emerald-200"
+          : "bg-rose-500/20 text-rose-200";
+        return el("span", { class: `rounded px-2 py-0.5 text-xs ${cls}`, text });
+      }
+
+      function mkHeaders(state) {
+        const h = { "content-type": "application/json" };
+        const key = (state.adminKey || "").trim();
+        if (key) h["x-codex-proxy-key"] = key;
+        return h;
+      }
+
+      async function apiGet(state, path) {
+        state.error = "";
+        const r = await fetch(path, { method: "GET", headers: mkHeaders(state) });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data?.error?.message || `${r.status} ${r.statusText}`);
+        return data;
+      }
+
+      async function apiJson(state, method, path, body) {
+        state.error = "";
+        const r = await fetch(path, {
+          method,
+          headers: mkHeaders(state),
+          body: JSON.stringify(body),
         });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data?.error?.message || `${r.status} ${r.statusText}`);
+        return data;
+      }
 
-        async function apiGet(path) {
-          setError("");
-          const r = await fetch(path, { method: "GET", headers: headers() });
-          const data = await r.json().catch(() => ({}));
-          if (!r.ok) throw new Error(data?.error?.message || `${r.status} ${r.statusText}`);
-          return data;
-        }
+      function th(text) {
+        return el("th", { class: "px-3 py-2", text });
+      }
 
-        async function apiJson(method, path, body) {
-          setError("");
-          const r = await fetch(path, { method, headers: headers(), body: JSON.stringify(body) });
-          const data = await r.json().catch(() => ({}));
-          if (!r.ok) throw new Error(data?.error?.message || `${r.status} ${r.statusText}`);
-          return data;
-        }
+      function tdMono(text) {
+        return el("td", { class: "px-3 py-2 font-mono text-xs", text: text || "" });
+      }
 
-        const [configPath, setConfigPath] = createSignal("");
-        const [configJson, setConfigJson] = createSignal("");
-
-        const [accountsSnapshot, setAccountsSnapshot] = createSignal({ accounts: [], sticky_bindings: 0 });
-        const [accessKeys, setAccessKeys] = createSignal([]);
-        const [createdKey, setCreatedKey] = createSignal(null);
-        const [usageKeys, setUsageKeys] = createSignal([]);
-        const [usageAccounts, setUsageAccounts] = createSignal([]);
-
-        async function refreshAll() {
-          setBusy(true);
-          try {
-            const cfg = await apiGet("/api/config");
-            setConfigPath(cfg.config_path || "");
-            setConfigJson(jsonPretty(cfg.config || {}));
-
-            const accounts = await apiGet("/api/accounts");
-            setAccountsSnapshot(accounts);
-
-            const keys = await apiGet("/api/access-keys");
-            setAccessKeys(keys.keys || []);
-
-            const uk = await apiGet("/api/usage/keys");
-            setUsageKeys(uk.keys || []);
-            const ua = await apiGet("/api/usage/accounts");
-            setUsageAccounts(ua.accounts || []);
-          } catch (e) {
-            setError(maskError(e));
-          } finally {
-            setBusy(false);
-          }
-        }
-
-        createEffect(() => {
-          localStorage.setItem(STORAGE_KEY, adminKey());
-        });
-
-        createEffect(() => {
-          refreshAll();
-        });
-
-        async function saveConfig() {
-          setBusy(true);
-          try {
-            const parsed = JSON.parse(configJson());
-            const saved = await apiJson("POST", "/api/config", parsed);
-            setConfigPath(saved.config_path || "");
-            setConfigJson(jsonPretty(saved.config || {}));
-          } catch (e) {
-            setError(maskError(e));
-          } finally {
-            setBusy(false);
-          }
-        }
-
-        const [newKeyId, setNewKeyId] = createSignal("");
-        const [newKeyName, setNewKeyName] = createSignal("");
-        const [newKeyAdmin, setNewKeyAdmin] = createSignal(false);
-        const [newKeyEnabled, setNewKeyEnabled] = createSignal(true);
-
-        async function createAccessKey() {
-          setBusy(true);
-          setCreatedKey(null);
-          try {
-            const resp = await apiJson("POST", "/api/access-keys", {
-              id: newKeyId().trim() || null,
-              name: newKeyName().trim() || null,
-              is_admin: !!newKeyAdmin(),
-              enabled: !!newKeyEnabled(),
-            });
-            setCreatedKey(resp);
-            setNewKeyId("");
-            setNewKeyName("");
-            setNewKeyAdmin(false);
-            setNewKeyEnabled(true);
-            const keys = await apiGet("/api/access-keys");
-            setAccessKeys(keys.keys || []);
-          } catch (e) {
-            setError(maskError(e));
-          } finally {
-            setBusy(false);
-          }
-        }
-
-        async function deleteAccessKey(id) {
-          setBusy(true);
-          try {
-            await fetch(`/api/access-keys/${encodeURIComponent(id)}`, {
-              method: "DELETE",
-              headers: headers(),
-            }).then(async (r) => {
-              const data = await r.json().catch(() => ({}));
-              if (!r.ok) throw new Error(data?.error?.message || `${r.status} ${r.statusText}`);
-              return data;
-            });
-            const keys = await apiGet("/api/access-keys");
-            setAccessKeys(keys.keys || []);
-          } catch (e) {
-            setError(maskError(e));
-          } finally {
-            setBusy(false);
-          }
-        }
-
-        function Card(props) {
-          return (
-            <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
-              <div class="mb-3 flex items-center justify-between gap-3">
-                <h2 class="text-sm font-semibold text-slate-100">{props.title}</h2>
-                <div class="text-xs text-slate-400">{props.right}</div>
-              </div>
-              {props.children}
-            </div>
-          );
-        }
-
-        function Tabs() {
-          const items = [
-            ["overview", "Overview"],
-            ["accounts", "Accounts"],
-            ["keys", "Access Keys"],
-            ["usage", "Usage"],
-            ["config", "Config"],
-          ];
-          return (
-            <div class="flex flex-wrap gap-2">
-              <For each={items}>
-                {([id, label]) => (
-                  <button
-                    class={`rounded-lg px-3 py-1.5 text-sm ${
-                      tab() === id
-                        ? "bg-slate-100 text-slate-950"
-                        : "bg-slate-800/60 text-slate-200 hover:bg-slate-800"
-                    }`}
-                    onClick={() => setTab(id)}
-                  >
-                    {label}
-                  </button>
-                )}
-              </For>
-            </div>
-          );
-        }
-
-        return (
-          <div class="min-h-screen">
-            <header class="sticky top-0 z-10 border-b border-slate-800 bg-slate-950/70 backdrop-blur">
-              <div class="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-3 md:flex-row md:items-center md:justify-between">
-                <div class="flex items-center gap-3">
-                  <div class="h-9 w-9 rounded-xl bg-slate-800"></div>
-                  <div>
-                    <div class="text-sm font-semibold">codex-proxy Admin</div>
-                    <div class="text-xs text-slate-400">{configPath() ? `Config: ${configPath()}` : "Config: (unknown)"}</div>
-                  </div>
-                </div>
-                <div class="flex flex-col gap-2 md:flex-row md:items-center">
-                  <input
-                    class="w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 md:w-96"
-                    placeholder="Admin access key (x-codex-proxy-key)"
-                    value={adminKey()}
-                    onInput={(e) => setAdminKey(e.currentTarget.value)}
-                  />
-                  <button
-                    class="rounded-lg bg-indigo-500 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-50"
-                    onClick={refreshAll}
-                    disabled={busy()}
-                  >
-                    Refresh
-                  </button>
-                </div>
-              </div>
-            </header>
-
-            <main class="mx-auto grid max-w-6xl gap-4 px-4 py-4">
-              <Tabs />
-
-              <Show when={error()}>
-                <div class="rounded-xl border border-rose-900/60 bg-rose-950/40 p-3 text-sm text-rose-100">
-                  {error()}
-                </div>
-              </Show>
-
-              <Show when={tab() === "overview"}>
-                <div class="grid gap-4 md:grid-cols-2">
-                  <Card title="Runtime" right={busy() ? "busy" : "idle"}>
-                    <div class="grid grid-cols-2 gap-3 text-sm">
-                      <div class="rounded-lg bg-slate-950/60 p-3">
-                        <div class="text-xs text-slate-400">Accounts</div>
-                        <div class="mt-1 text-lg font-semibold">{(accountsSnapshot()?.accounts || []).length}</div>
-                      </div>
-                      <div class="rounded-lg bg-slate-950/60 p-3">
-                        <div class="text-xs text-slate-400">Sticky bindings</div>
-                        <div class="mt-1 text-lg font-semibold">{accountsSnapshot()?.sticky_bindings || 0}</div>
-                      </div>
-                    </div>
-                    <div class="mt-3 text-xs text-slate-400">
-                      Admin APIs require an admin access key in config `access.keys[]`.
-                    </div>
-                  </Card>
-                  <Card title="Notes">
-                    <ul class="list-disc pl-5 text-sm text-slate-200">
-                      <li>Incoming auth accepts `x-codex-proxy-key`, `x-api-key`, or `Authorization: Bearer`.</li>
-                      <li>For Z.AI Authorization passthrough, prefer `x-codex-proxy-key` for proxy auth.</li>
-                      <li>Config save persists to the currently loaded config path.</li>
-                    </ul>
-                  </Card>
-                </div>
-              </Show>
-
-              <Show when={tab() === "accounts"}>
-                <Card title="Account Health" right="GET /api/accounts">
-                  <div class="overflow-auto">
-                    <table class="min-w-full text-sm">
-                      <thead class="text-left text-xs text-slate-400">
-                        <tr>
-                          <th class="px-3 py-2">ID</th>
-                          <th class="px-3 py-2">Provider</th>
-                          <th class="px-3 py-2">Alive</th>
-                          <th class="px-3 py-2">Failures</th>
-                          <th class="px-3 py-2">Cache hits</th>
-                          <th class="px-3 py-2">Unhealthy until</th>
-                          <th class="px-3 py-2">Auth</th>
-                        </tr>
-                      </thead>
-                      <tbody class="divide-y divide-slate-800">
-                        <For each={accountsSnapshot()?.accounts || []}>
-                          {(a) => (
-                            <tr>
-                              <td class="px-3 py-2 font-mono text-xs">{a.id}</td>
-                              <td class="px-3 py-2">{a.provider}</td>
-                              <td class="px-3 py-2">
-                                <span class={`rounded px-2 py-0.5 text-xs ${a.alive ? "bg-emerald-500/20 text-emerald-200" : "bg-rose-500/20 text-rose-200"}`}>
-                                  {a.alive ? "healthy" : "unhealthy"}
-                                </span>
-                              </td>
-                              <td class="px-3 py-2">{a.consecutive_failures}</td>
-                              <td class="px-3 py-2">{a.cache_key_hits}</td>
-                              <td class="px-3 py-2 font-mono text-xs">{a.unhealthy_until || ""}</td>
-                              <td class="px-3 py-2 font-mono text-xs">{a.auth?.api_key_masked || a.auth?.creds_path || a.auth?.auth_type}</td>
-                            </tr>
-                          )}
-                        </For>
-                      </tbody>
-                    </table>
-                  </div>
-                </Card>
-              </Show>
-
-              <Show when={tab() === "keys"}>
-                <div class="grid gap-4 md:grid-cols-2">
-                  <Card title="Create Access Key" right="POST /api/access-keys">
-                    <div class="grid gap-2 text-sm">
-                      <label class="text-xs text-slate-400">ID (optional)</label>
-                      <input class="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2"
-                        value={newKeyId()} onInput={(e) => setNewKeyId(e.currentTarget.value)} />
-                      <label class="text-xs text-slate-400">Name (optional)</label>
-                      <input class="rounded-lg border border-slate-800 bg-slate-950 px-3 py-2"
-                        value={newKeyName()} onInput={(e) => setNewKeyName(e.currentTarget.value)} />
-                      <div class="mt-2 flex items-center gap-3">
-                        <label class="flex items-center gap-2">
-                          <input type="checkbox" checked={newKeyEnabled()} onChange={(e) => setNewKeyEnabled(e.currentTarget.checked)} />
-                          <span>Enabled</span>
-                        </label>
-                        <label class="flex items-center gap-2">
-                          <input type="checkbox" checked={newKeyAdmin()} onChange={(e) => setNewKeyAdmin(e.currentTarget.checked)} />
-                          <span>Admin</span>
-                        </label>
-                      </div>
-                      <button class="mt-2 rounded-lg bg-indigo-500 px-3 py-2 font-semibold text-white hover:bg-indigo-400 disabled:opacity-50"
-                        onClick={createAccessKey} disabled={busy()}>
-                        Create
-                      </button>
-                      <Show when={createdKey()}>
-                        <div class="mt-3 rounded-lg border border-emerald-900/60 bg-emerald-950/30 p-3">
-                          <div class="text-xs text-emerald-200">Created key (copy once)</div>
-                          <div class="mt-1 font-mono text-xs text-emerald-100 break-all">{createdKey().key}</div>
-                          <div class="mt-1 text-xs text-emerald-200">ID: {createdKey().id}</div>
-                        </div>
-                      </Show>
-                    </div>
-                  </Card>
-                  <Card title="Access Keys" right="GET /api/access-keys">
-                    <div class="overflow-auto">
-                      <table class="min-w-full text-sm">
-                        <thead class="text-left text-xs text-slate-400">
-                          <tr>
-                            <th class="px-3 py-2">ID</th>
-                            <th class="px-3 py-2">Enabled</th>
-                            <th class="px-3 py-2">Admin</th>
-                            <th class="px-3 py-2">SHA256</th>
-                            <th class="px-3 py-2"></th>
-                          </tr>
-                        </thead>
-                        <tbody class="divide-y divide-slate-800">
-                          <For each={accessKeys()}>
-                            {(k) => (
-                              <tr>
-                                <td class="px-3 py-2 font-mono text-xs">{k.id}</td>
-                                <td class="px-3 py-2">{k.enabled ? "yes" : "no"}</td>
-                                <td class="px-3 py-2">{k.is_admin ? "yes" : "no"}</td>
-                                <td class="px-3 py-2 font-mono text-xs">{(k.key_sha256 || "").slice(0, 12)}…</td>
-                                <td class="px-3 py-2 text-right">
-                                  <button class="rounded bg-rose-500/20 px-2 py-1 text-xs text-rose-200 hover:bg-rose-500/30"
-                                    onClick={() => deleteAccessKey(k.id)} disabled={busy()}>
-                                    Delete
-                                  </button>
-                                </td>
-                              </tr>
-                            )}
-                          </For>
-                        </tbody>
-                      </table>
-                    </div>
-                  </Card>
-                </div>
-              </Show>
-
-              <Show when={tab() === "usage"}>
-                <div class="grid gap-4 md:grid-cols-2">
-                  <Card title="Usage by Access Key" right="GET /api/usage/keys">
-                    <div class="overflow-auto">
-                      <table class="min-w-full text-sm">
-                        <thead class="text-left text-xs text-slate-400">
-                          <tr>
-                            <th class="px-3 py-2">Key</th>
-                            <th class="px-3 py-2">Requests</th>
-                            <th class="px-3 py-2">Errors</th>
-                            <th class="px-3 py-2">Last</th>
-                          </tr>
-                        </thead>
-                        <tbody class="divide-y divide-slate-800">
-                          <For each={usageKeys()}>
-                            {(u) => (
-                              <tr>
-                                <td class="px-3 py-2 font-mono text-xs">{u.key_id}</td>
-                                <td class="px-3 py-2">{u.requests}</td>
-                                <td class="px-3 py-2">{u.errors}</td>
-                                <td class="px-3 py-2 font-mono text-xs">{u.last_seen_at || ""}</td>
-                              </tr>
-                            )}
-                          </For>
-                        </tbody>
-                      </table>
-                    </div>
-                  </Card>
-                  <Card title="Usage by Upstream Account" right="GET /api/usage/accounts">
-                    <div class="overflow-auto">
-                      <table class="min-w-full text-sm">
-                        <thead class="text-left text-xs text-slate-400">
-                          <tr>
-                            <th class="px-3 py-2">Provider</th>
-                            <th class="px-3 py-2">Account</th>
-                            <th class="px-3 py-2">Requests</th>
-                            <th class="px-3 py-2">Errors</th>
-                            <th class="px-3 py-2">Cache</th>
-                          </tr>
-                        </thead>
-                        <tbody class="divide-y divide-slate-800">
-                          <For each={usageAccounts()}>
-                            {(u) => (
-                              <tr>
-                                <td class="px-3 py-2">{u.provider}</td>
-                                <td class="px-3 py-2 font-mono text-xs">{u.account_id}</td>
-                                <td class="px-3 py-2">{u.requests}</td>
-                                <td class="px-3 py-2">{u.errors}</td>
-                                <td class="px-3 py-2">{u.cache_hits}</td>
-                              </tr>
-                            )}
-                          </For>
-                        </tbody>
-                      </table>
-                    </div>
-                  </Card>
-                </div>
-              </Show>
-
-              <Show when={tab() === "config"}>
-                <Card title="Config Editor" right="POST /api/config">
-                  <div class="grid gap-2">
-                    <div class="text-xs text-slate-400">
-                      This editor saves the full config file at the current config path.
-                    </div>
-                    <textarea
-                      class="h-[520px] w-full rounded-lg border border-slate-800 bg-slate-950 p-3 font-mono text-xs text-slate-100"
-                      value={configJson()}
-                      onInput={(e) => setConfigJson(e.currentTarget.value)}
-                      spellcheck="false"
-                    ></textarea>
-                    <div class="flex items-center justify-between gap-3">
-                      <div class="text-xs text-slate-500">Tip: API keys shown are masked in GET.</div>
-                      <button
-                        class="rounded-lg bg-emerald-500 px-3 py-2 text-sm font-semibold text-emerald-950 hover:bg-emerald-400 disabled:opacity-50"
-                        onClick={saveConfig}
-                        disabled={busy()}
-                      >
-                        Save
-                      </button>
-                    </div>
-                  </div>
-                </Card>
-              </Show>
-            </main>
-          </div>
+      function statBox(label, value) {
+        return el(
+          "div",
+          { class: "rounded-lg bg-slate-950/60 p-3" },
+          el("div", { class: "text-xs text-slate-400", text: label }),
+          el("div", { class: "mt-1 text-lg font-semibold", text: value })
         );
       }
 
-      render(() => <App />, document.getElementById("app"));
+      function card(title, right, children) {
+        return el(
+          "div",
+          { class: "rounded-xl border border-slate-800 bg-slate-900/40 p-4" },
+          el(
+            "div",
+            { class: "mb-3 flex items-center justify-between gap-3" },
+            el("h2", { class: "text-sm font-semibold text-slate-100", text: title }),
+            el("div", { class: "text-xs text-slate-400", text: right || "" })
+          ),
+          ...(children || [])
+        );
+      }
+
+      function renderApp(root, state) {
+        root.innerHTML = "";
+
+        const header = el(
+          "header",
+          { class: "sticky top-0 z-10 border-b border-slate-800 bg-slate-950/70 backdrop-blur" },
+          el(
+            "div",
+            {
+              class:
+                "mx-auto flex max-w-6xl flex-col gap-3 px-4 py-3 md:flex-row md:items-center md:justify-between",
+            },
+            el(
+              "div",
+              { class: "flex items-center gap-3" },
+              el("div", { class: "h-9 w-9 rounded-xl bg-slate-800" }),
+              el(
+                "div",
+                null,
+                el("div", { class: "text-sm font-semibold", text: "codex-proxy Admin" }),
+                el("div", {
+                  class: "text-xs text-slate-400",
+                  text: state.configPath ? `Config: ${state.configPath}` : "Config: (unknown)",
+                })
+              )
+            ),
+            el(
+              "div",
+              { class: "flex flex-col gap-2 md:flex-row md:items-center" },
+              el("input", {
+                class:
+                  "w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm text-slate-100 placeholder:text-slate-500 md:w-96",
+                placeholder: "Admin access key (x-codex-proxy-key)",
+                value: state.adminKey,
+                oninput: (e) => {
+                  state.adminKey = e.currentTarget.value;
+                  localStorage.setItem(STORAGE_KEY, state.adminKey);
+                },
+              }),
+              el(
+                "button",
+                {
+                  class:
+                    "rounded-lg bg-indigo-500 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-50",
+                  disabled: state.busy ? true : null,
+                  onclick: async () => {
+                    await refreshAll(state, root);
+                  },
+                },
+                "Refresh"
+              )
+            )
+          )
+        );
+
+        const tabs = el(
+          "div",
+          { class: "flex flex-wrap gap-2" },
+          TABS.map(([id, label]) =>
+            el(
+              "button",
+              {
+                class:
+                  "rounded-lg px-3 py-1.5 text-sm " +
+                  (state.tab === id
+                    ? "bg-slate-100 text-slate-950"
+                    : "bg-slate-800/60 text-slate-200 hover:bg-slate-800"),
+                onclick: () => {
+                  state.tab = id;
+                  renderApp(root, state);
+                },
+              },
+              label
+            )
+          )
+        );
+
+        const main = el("main", { class: "mx-auto grid max-w-6xl gap-4 px-4 py-4" }, tabs);
+        if (state.error) {
+          main.appendChild(
+            el("div", {
+              class: "rounded-xl border border-rose-900/60 bg-rose-950/40 p-3 text-sm text-rose-100",
+              text: state.error,
+            })
+          );
+        }
+
+        if (state.tab === "overview") {
+          main.appendChild(
+            el(
+              "div",
+              { class: "grid gap-4 md:grid-cols-2" },
+              card("Runtime", state.busy ? "busy" : "idle", [
+                el(
+                  "div",
+                  { class: "grid grid-cols-2 gap-3 text-sm" },
+                  statBox("Accounts", String((state.accountsSnapshot.accounts || []).length)),
+                  statBox("Sticky bindings", String(state.accountsSnapshot.sticky_bindings || 0))
+                ),
+                el("div", {
+                  class: "mt-3 text-xs text-slate-400",
+                  text: "Admin APIs require an admin access key in config access.keys[].",
+                }),
+              ]),
+              card("Notes", "", [
+                el(
+                  "ul",
+                  { class: "list-disc pl-5 text-sm text-slate-200" },
+                  el("li", {
+                    text: "Incoming auth accepts x-codex-proxy-key, x-api-key, or Authorization: Bearer.",
+                  }),
+                  el("li", {
+                    text: "For Z.AI Authorization passthrough, prefer x-codex-proxy-key for proxy auth.",
+                  }),
+                  el("li", { text: "Config save persists to the currently loaded config path." })
+                ),
+              ])
+            )
+          );
+        }
+
+        if (state.tab === "accounts") {
+          const rows = (state.accountsSnapshot.accounts || []).map((a) =>
+            el(
+              "tr",
+              null,
+              tdMono(a.id),
+              el("td", { class: "px-3 py-2", text: a.provider }),
+              el("td", { class: "px-3 py-2" }, badge(!!a.alive, "healthy", "unhealthy")),
+              el("td", { class: "px-3 py-2", text: String(a.consecutive_failures ?? "") }),
+              el("td", { class: "px-3 py-2", text: String(a.cache_key_hits ?? "") }),
+              el("td", { class: "px-3 py-2 font-mono text-xs", text: a.unhealthy_until || "" }),
+              el("td", {
+                class: "px-3 py-2 font-mono text-xs",
+                text: a.auth?.api_key_masked || a.auth?.creds_path || a.auth?.auth_type || "",
+              })
+            )
+          );
+
+          main.appendChild(
+            card("Account Health", "GET /api/accounts", [
+              el(
+                "div",
+                { class: "overflow-auto" },
+                el(
+                  "table",
+                  { class: "min-w-full text-sm" },
+                  el(
+                    "thead",
+                    { class: "text-left text-xs text-slate-400" },
+                    el(
+                      "tr",
+                      null,
+                      th("ID"),
+                      th("Provider"),
+                      th("Alive"),
+                      th("Failures"),
+                      th("Cache hits"),
+                      th("Unhealthy until"),
+                      th("Auth")
+                    )
+                  ),
+                  el("tbody", { class: "divide-y divide-slate-800" }, rows)
+                )
+              ),
+            ])
+          );
+        }
+
+        if (state.tab === "keys") {
+          const createdBox = state.createdKey
+            ? el(
+                "div",
+                { class: "mt-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3" },
+                el("div", { class: "text-xs text-slate-400", text: "New key (store it now):" }),
+                el("div", {
+                  class: "mt-1 font-mono text-xs break-all",
+                  text: state.createdKey.plaintext || "",
+                }),
+                el(
+                  "div",
+                  { class: "mt-1 text-xs text-slate-400" },
+                  "SHA256: ",
+                  el("span", { class: "font-mono", text: state.createdKey.key_sha256 || "" })
+                )
+              )
+            : null;
+
+          const keysRows = (state.accessKeys || []).map((k) =>
+            el(
+              "tr",
+              null,
+              tdMono(k.id),
+              el("td", { class: "px-3 py-2", text: k.is_admin ? "yes" : "no" }),
+              el("td", { class: "px-3 py-2", text: k.enabled ? "yes" : "no" }),
+              el("td", { class: "px-3 py-2", text: k.name || "" }),
+              el("td", { class: "px-3 py-2 font-mono text-xs", text: k.key_sha256 || "" }),
+              el(
+                "td",
+                { class: "px-3 py-2" },
+                el(
+                  "button",
+                  {
+                    class:
+                      "rounded bg-rose-500/20 px-2 py-1 text-xs text-rose-200 hover:bg-rose-500/30 disabled:opacity-50",
+                    disabled: state.busy ? true : null,
+                    onclick: async () => {
+                      await deleteAccessKey(state, root, k.id);
+                    },
+                  },
+                  "Delete"
+                )
+              )
+            )
+          );
+
+          main.appendChild(
+            el(
+              "div",
+              { class: "grid gap-4 md:grid-cols-2" },
+              card("Create Access Key", "POST /api/access-keys", [
+                el(
+                  "div",
+                  { class: "grid gap-2 text-sm" },
+                  el("label", { class: "text-xs text-slate-400", text: "ID (optional)" }),
+                  el("input", {
+                    class: "rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 font-mono text-xs",
+                    value: state.newKeyId,
+                    oninput: (e) => (state.newKeyId = e.currentTarget.value),
+                  }),
+                  el("label", { class: "mt-2 text-xs text-slate-400", text: "Name (optional)" }),
+                  el("input", {
+                    class: "rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 text-sm",
+                    value: state.newKeyName,
+                    oninput: (e) => (state.newKeyName = e.currentTarget.value),
+                  }),
+                  el(
+                    "label",
+                    { class: "mt-2 flex items-center gap-2" },
+                    el("input", {
+                      type: "checkbox",
+                      checked: state.newKeyAdmin ? true : null,
+                      onchange: (e) => (state.newKeyAdmin = e.currentTarget.checked),
+                    }),
+                    el("span", { text: "Admin" })
+                  ),
+                  el(
+                    "label",
+                    { class: "flex items-center gap-2" },
+                    el("input", {
+                      type: "checkbox",
+                      checked: state.newKeyEnabled ? true : null,
+                      onchange: (e) => (state.newKeyEnabled = e.currentTarget.checked),
+                    }),
+                    el("span", { text: "Enabled" })
+                  ),
+                  el(
+                    "button",
+                    {
+                      class:
+                        "mt-2 rounded-lg bg-indigo-500 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-50",
+                      disabled: state.busy ? true : null,
+                      onclick: async () => {
+                        await createAccessKey(state, root);
+                      },
+                    },
+                    "Create"
+                  ),
+                  createdBox
+                ),
+              ]),
+              card("Existing Keys", "GET /api/access-keys", [
+                el(
+                  "div",
+                  { class: "overflow-auto" },
+                  el(
+                    "table",
+                    { class: "min-w-full text-sm" },
+                    el(
+                      "thead",
+                      { class: "text-left text-xs text-slate-400" },
+                      el("tr", null, th("ID"), th("Admin"), th("Enabled"), th("Name"), th("Key SHA256"), th(""))
+                    ),
+                    el("tbody", { class: "divide-y divide-slate-800" }, keysRows)
+                  )
+                ),
+              ])
+            )
+          );
+        }
+
+        if (state.tab === "usage") {
+          main.appendChild(
+            el(
+              "div",
+              { class: "grid gap-4 md:grid-cols-2" },
+              card("Key Usage", "GET /api/usage/keys", [
+                el("pre", {
+                  class:
+                    "whitespace-pre-wrap break-words rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-200",
+                  text: jsonPretty(state.usageKeys || []),
+                }),
+              ]),
+              card("Account Usage", "GET /api/usage/accounts", [
+                el("pre", {
+                  class:
+                    "whitespace-pre-wrap break-words rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-200",
+                  text: jsonPretty(state.usageAccounts || []),
+                }),
+              ])
+            )
+          );
+        }
+
+        if (state.tab === "config") {
+          main.appendChild(
+            card("Config Editor", "POST /api/config", [
+              el(
+                "div",
+                { class: "grid gap-2" },
+                el("textarea", {
+                  class:
+                    "h-[560px] w-full rounded-lg border border-slate-800 bg-slate-950 px-3 py-2 font-mono text-xs",
+                  oninput: (e) => (state.configJson = e.currentTarget.value),
+                }),
+                el(
+                  "div",
+                  { class: "flex items-center justify-between" },
+                  el("div", { class: "text-xs text-slate-400", text: "Edits apply immediately after saving." }),
+                  el(
+                    "button",
+                    {
+                      class:
+                        "rounded-lg bg-indigo-500 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-50",
+                      disabled: state.busy ? true : null,
+                      onclick: async () => {
+                        await saveConfig(state, root);
+                      },
+                    },
+                    "Save"
+                  )
+                )
+              ),
+            ])
+          );
+
+          const textarea = main.querySelector("textarea");
+          if (textarea) textarea.value = state.configJson || "";
+        }
+
+        root.appendChild(header);
+        root.appendChild(main);
+      }
+
+      async function refreshAll(state, root) {
+        state.busy = true;
+        state.error = "";
+        renderApp(root, state);
+        if (!(state.adminKey || "").trim()) {
+          state.error = "Admin access key required.";
+          state.busy = false;
+          renderApp(root, state);
+          return;
+        }
+        try {
+          const cfg = await apiGet(state, "/api/config");
+          state.configPath = cfg.config_path || "";
+          state.configJson = jsonPretty(cfg.config || {});
+
+          const accounts = await apiGet(state, "/api/accounts");
+          state.accountsSnapshot = accounts || { accounts: [], sticky_bindings: 0 };
+
+          const keys = await apiGet(state, "/api/access-keys");
+          state.accessKeys = keys.keys || [];
+
+          const uk = await apiGet(state, "/api/usage/keys");
+          state.usageKeys = uk.keys || [];
+          const ua = await apiGet(state, "/api/usage/accounts");
+          state.usageAccounts = ua.accounts || [];
+        } catch (e) {
+          state.error = maskError(e);
+        } finally {
+          state.busy = false;
+          renderApp(root, state);
+        }
+      }
+
+      async function saveConfig(state, root) {
+        state.busy = true;
+        state.error = "";
+        renderApp(root, state);
+        try {
+          const parsed = JSON.parse(state.configJson || "{}");
+          const saved = await apiJson(state, "POST", "/api/config", parsed);
+          state.configPath = saved.config_path || "";
+          state.configJson = jsonPretty(saved.config || {});
+        } catch (e) {
+          state.error = maskError(e);
+        } finally {
+          state.busy = false;
+          renderApp(root, state);
+        }
+      }
+
+      async function createAccessKey(state, root) {
+        state.busy = true;
+        state.error = "";
+        state.createdKey = null;
+        renderApp(root, state);
+        try {
+          const resp = await apiJson(state, "POST", "/api/access-keys", {
+            id: (state.newKeyId || "").trim() || null,
+            name: (state.newKeyName || "").trim() || null,
+            is_admin: !!state.newKeyAdmin,
+            enabled: !!state.newKeyEnabled,
+          });
+          state.createdKey = resp || null;
+          state.newKeyId = "";
+          state.newKeyName = "";
+          state.newKeyAdmin = false;
+          state.newKeyEnabled = true;
+          const keys = await apiGet(state, "/api/access-keys");
+          state.accessKeys = keys.keys || [];
+        } catch (e) {
+          state.error = maskError(e);
+        } finally {
+          state.busy = false;
+          renderApp(root, state);
+        }
+      }
+
+      async function deleteAccessKey(state, root, id) {
+        state.busy = true;
+        state.error = "";
+        renderApp(root, state);
+        try {
+          const r = await fetch(`/api/access-keys/${encodeURIComponent(id)}`, {
+            method: "DELETE",
+            headers: mkHeaders(state),
+          });
+          const data = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(data?.error?.message || `${r.status} ${r.statusText}`);
+          const keys = await apiGet(state, "/api/access-keys");
+          state.accessKeys = keys.keys || [];
+        } catch (e) {
+          state.error = maskError(e);
+        } finally {
+          state.busy = false;
+          renderApp(root, state);
+        }
+      }
+
+      const root = document.getElementById("app");
+      const state = {
+        adminKey: localStorage.getItem(STORAGE_KEY) || "",
+        tab: "overview",
+        error: "",
+        busy: false,
+        configPath: "",
+        configJson: "{}",
+        accountsSnapshot: { accounts: [], sticky_bindings: 0 },
+        accessKeys: [],
+        createdKey: null,
+        usageKeys: [],
+        usageAccounts: [],
+        newKeyId: "",
+        newKeyName: "",
+        newKeyAdmin: false,
+        newKeyEnabled: true,
+      };
+
+      renderApp(root, state);
+      refreshAll(state, root);
     </script>
   </body>
 </html>
-

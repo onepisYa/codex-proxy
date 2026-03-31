@@ -39,7 +39,7 @@ async fn main() {
         .expect("Failed to bind");
     info!("Server bound to {addr}");
     info!("UI: http://{}:{}/ui", ui_host, ui_port);
-    info!("Config snapshot: http://{}:{}/config", ui_host, ui_port);
+    info!("Admin API: http://{}:{}/api/config", ui_host, ui_port);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

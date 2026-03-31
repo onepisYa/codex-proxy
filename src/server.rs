@@ -35,9 +35,9 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health_handler))
+        .route("/favicon.ico", get(favicon_handler))
         .route("/", get(ui_handler))
         .route("/ui", get(ui_handler))
-        .route("/config", get(config_get_handler).post(config_post_handler))
         .route("/api/config", get(api_config_get).post(api_config_put))
         .route("/api/accounts", get(api_accounts_get))
         .route(
@@ -144,20 +144,8 @@ async fn health_handler() -> &'static str {
     "ok"
 }
 
-async fn config_get_handler(State(state): State<AppState>) -> Json<ui::UiConfig> {
-    Json(ui::get_current_config(&state))
-}
-
-async fn config_post_handler(
-    State(state): State<AppState>,
-    Json(data): Json<ui::UiConfigUpdate>,
-) -> Result<Json<ui::UiConfig>, (StatusCode, Json<ui::UiConfig>)> {
-    Ok(Json(ui::apply_and_save(&data, &state).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ui::get_current_config(&state)),
-        )
-    })?))
+async fn favicon_handler() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 async fn responses_handler(
