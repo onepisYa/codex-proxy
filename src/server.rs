@@ -1046,7 +1046,6 @@ mod auto_compaction_tests {
                 host: "127.0.0.1".into(),
                 port: 8765,
                 log_level: "INFO".into(),
-                debug_mode: false,
             },
             providers: HashMap::from([
                 (

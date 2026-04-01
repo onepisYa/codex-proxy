@@ -36,7 +36,6 @@ pub struct UiServerConfig {
     pub host: String,
     pub port: u16,
     pub log_level: String,
-    pub debug_mode: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -70,7 +69,6 @@ pub fn get_current_config(state: &AppState) -> UiConfig {
             host: cfg.server.host.clone(),
             port: cfg.server.port,
             log_level: cfg.server.log_level.clone(),
-            debug_mode: cfg.server.debug_mode,
         },
         providers: cfg.providers.clone(),
         models: UiModelsConfig {

@@ -2,8 +2,7 @@
   "server": {
     "host": "127.0.0.1",
     "port": 8765,
-    "log_level": "DEBUG",
-    "debug_mode": true
+    "log_level": "DEBUG"
   },
   "providers": {
     "gemini": {

@@ -95,11 +95,6 @@ class TestConfigEnvOverrides:
         cfg = Config()
         assert cfg.log_level == "WARNING"
 
-    def test_debug_mode_from_env(self, monkeypatch):
-        monkeypatch.setenv("CODEX_PROXY_DEBUG", "false")
-        cfg = Config()
-        assert cfg.debug_mode is False
-
 
 class TestConfigFileLoading:
     """Test loading configuration from file."""

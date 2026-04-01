@@ -121,7 +121,6 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub log_level: String,
-    pub debug_mode: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -800,9 +799,6 @@ impl Config {
         let log_level = env::var("CODEX_PROXY_LOG_LEVEL")
             .unwrap_or_else(|_| "DEBUG".into())
             .to_uppercase();
-        let debug_mode = env::var("CODEX_PROXY_DEBUG")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(true);
 
         let gemini_api_internal = env::var("CODEX_PROXY_GEMINI_API_INTERNAL")
             .unwrap_or_else(|_| "https://cloudcode-pa.googleapis.com".into());
@@ -917,7 +913,6 @@ impl Config {
                 host,
                 port,
                 log_level,
-                debug_mode,
             },
             providers,
             models: ModelsConfig {
@@ -1588,7 +1583,6 @@ mod tests {
                 host: "127.0.0.1".into(),
                 port: 8765,
                 log_level: "INFO".into(),
-                debug_mode: false,
             },
             providers: HashMap::from([
                 (
@@ -1778,8 +1772,7 @@ mod tests {
             "server": {
                 "host": "127.0.0.1",
                 "port": 8765,
-                "log_level": "INFO",
-                "debug_mode": false
+                "log_level": "INFO"
             },
             "providers": {
                 "tabcode": {
@@ -1852,8 +1845,7 @@ mod tests {
             "server": {
                 "host": "127.0.0.1",
                 "port": 8765,
-                "log_level": "INFO",
-                "debug_mode": false
+                "log_level": "INFO"
             },
             "providers": {
                 "tabcode": {
@@ -1916,8 +1908,7 @@ mod tests {
             "server": {
                 "host": "127.0.0.1",
                 "port": 8765,
-                "log_level": "INFO",
-                "debug_mode": false
+                "log_level": "INFO"
             },
             "providers": {
                 "tabcode": {

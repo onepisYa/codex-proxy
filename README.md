@@ -77,8 +77,7 @@ Top-level sections:
   "server": {
     "host": "127.0.0.1",
     "port": 8765,
-    "log_level": "INFO",
-    "debug_mode": false
+    "log_level": "INFO"
   },
   "providers": {
     "gemini": {

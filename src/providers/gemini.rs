@@ -169,7 +169,6 @@ impl GeminiProvider {
             &model_owned,
             created_ts,
             req_data,
-            with_config(&context.config, |cfg| cfg.server.debug_mode),
         );
         let body = Body::from_stream(sse_stream);
         Ok(Response::builder()
