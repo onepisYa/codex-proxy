@@ -309,41 +309,6 @@ impl Provider for OpenAiProvider {
         })
     }
 
-    fn probe_account(
-        &self,
-        context: ProviderExecutionContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send + '_>>
-    {
-        let mut payload = json!({
-            "model": context.upstream_model(),
-            "input": "health check",
-            "store": false,
-            "max_tokens": 1,
-            "stream": false
-        });
-        apply_openai_route_overrides(&mut payload, &context);
-        Box::pin(async move {
-            let response = self.send_json(payload, HeaderMap::new(), &context).await?;
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
-            {
-                return Err(ProxyError::Auth(format!(
-                    "OpenAI recovery probe unauthorized ({}): {}",
-                    status, body
-                )));
-            }
-            if !status.is_success() {
-                return Err(ProxyError::Provider(format!(
-                    "OpenAI recovery probe failed ({}): {}",
-                    status, body
-                )));
-            }
-            Ok(())
-        })
-    }
-
     fn clone_box(&self) -> Box<dyn Provider + Send + Sync> {
         Box::new(OpenAiProvider {
             client: self.client.clone(),

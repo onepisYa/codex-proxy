@@ -149,51 +149,6 @@ impl Provider for ZAIProvider {
         Box::pin(async move { self.execute_request(&data, headers, &context).await })
     }
 
-    fn probe_account(
-        &self,
-        context: ProviderExecutionContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send + '_>>
-    {
-        Box::pin(async move {
-            let auth = resolve_zai_auth(HeaderMap::new(), &context)?;
-            let payload = ZaiChatRequest {
-                model: context.upstream_model().to_string(),
-                messages: vec![ZaiMessage {
-                    role: "user".into(),
-                    content: Some("health check".into()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                }],
-                stream: false,
-                tools: None,
-                tool_choice: None,
-                temperature: None,
-                top_p: None,
-                max_tokens: Some(1),
-                thinking: None,
-            };
-            let response = self.post_json(&payload, auth, &context).await?;
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
-            {
-                return Err(ProxyError::Auth(format!(
-                    "Z.AI recovery probe unauthorized ({}). Body: {}",
-                    status, body
-                )));
-            }
-            if !status.is_success() {
-                return Err(ProxyError::Provider(format!(
-                    "Z.AI recovery probe failed ({}): {}",
-                    status, body
-                )));
-            }
-            Ok(())
-        })
-    }
-
     fn clone_box(&self) -> Box<dyn Provider + Send + Sync> {
         Box::new(ZAIProvider {
             client: self.client.clone(),

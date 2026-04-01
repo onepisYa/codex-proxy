@@ -79,18 +79,5 @@ pub trait Provider: Send + Sync {
         })
     }
 
-    fn probe_account(
-        &self,
-        context: ProviderExecutionContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send + '_>>
-    {
-        Box::pin(async move {
-            let _ = context;
-            Err(ProxyError::Provider(
-                "Recovery probe not implemented for this provider".into(),
-            ))
-        })
-    }
-
     fn clone_box(&self) -> Box<dyn Provider + Send + Sync>;
 }

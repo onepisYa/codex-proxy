@@ -1320,6 +1320,52 @@ impl Config {
         &self.compaction.preferred_targets
     }
 
+    pub fn recovery_probe_target(&self, provider: &str) -> Option<RouteTargetConfig> {
+        self.routing
+            .model_provider_priority
+            .values()
+            .flat_map(|targets| targets.iter())
+            .find(|target| target.provider == provider)
+            .cloned()
+            .or_else(|| {
+                self.accounts
+                    .iter()
+                    .find(|account| account.enabled && account.provider == provider)
+                    .and_then(|account| {
+                        account.models.as_ref().and_then(|models| {
+                            models.iter().find_map(|model| {
+                                self.provider_catalog(provider).map_or(Some(model.clone()), |catalog| {
+                                    catalog.contains(model).then(|| model.clone())
+                                })
+                            })
+                        })
+                    })
+                    .map(|model| RouteTargetConfig {
+                        provider: provider.to_string(),
+                        model,
+                        endpoint: None,
+                        reasoning: None,
+                    })
+            })
+            .or_else(|| {
+                self.provider_catalog(provider).and_then(|catalog| {
+                    catalog.iter().find_map(|model| {
+                        self.accounts.iter().any(|account| {
+                            account.enabled
+                                && account.provider == provider
+                                && account.models.as_ref().is_some_and(|models| models.contains(model))
+                        })
+                        .then(|| RouteTargetConfig {
+                            provider: provider.to_string(),
+                            model: model.clone(),
+                            endpoint: None,
+                            reasoning: None,
+                        })
+                    })
+                })
+            })
+    }
+
     pub fn is_served_model_allowed(&self, model: &str) -> bool {
         self.models.served.is_empty() || self.models.served.iter().any(|m| m == model)
     }
@@ -1937,5 +1983,96 @@ mod tests {
         let targets = cfg.preferred_targets_for_model("unmapped-model").unwrap();
         assert_eq!(targets[0].provider, "tabcode");
         assert_eq!(targets[0].model, "gpt-4.1");
+    }
+
+    #[test]
+    fn recovery_probe_target_prefers_routing_target() {
+        let mut cfg = base_config();
+        cfg.providers.insert(
+            "route-only".into(),
+            ProviderConfig::OpenAi {
+                api_url: "https://route-only.example/v1/responses".into(),
+                models_url: None,
+                endpoints: HashMap::new(),
+                models: Vec::new(),
+            },
+        );
+        cfg.routing.model_provider_priority.insert(
+            "route-only-logical".into(),
+            vec![RouteTargetConfig {
+                provider: "route-only".into(),
+                model: "routed-model".into(),
+                endpoint: None,
+                reasoning: None,
+            }],
+        );
+        cfg.accounts.push(AccountConfig {
+            id: "route-only-a".into(),
+            provider: "route-only".into(),
+            enabled: true,
+            weight: 1,
+            models: None,
+            auth: AccountAuth::ApiKey {
+                api_key: "sk-test".into(),
+            },
+        });
+
+        let target = cfg.recovery_probe_target("route-only").unwrap();
+        assert_eq!(target.provider, "route-only");
+        assert_eq!(target.model, "routed-model");
+    }
+
+    #[test]
+    fn recovery_probe_target_uses_account_model_when_no_routing_target_exists() {
+        let mut cfg = base_config();
+        cfg.providers.insert(
+            "account-only".into(),
+            ProviderConfig::OpenAi {
+                api_url: "https://account-only.example/v1/responses".into(),
+                models_url: None,
+                endpoints: HashMap::new(),
+                models: vec!["account-model".into(), "other-model".into()],
+            },
+        );
+        cfg.accounts.push(AccountConfig {
+            id: "account-only-a".into(),
+            provider: "account-only".into(),
+            enabled: true,
+            weight: 1,
+            models: Some(vec!["account-model".into()]),
+            auth: AccountAuth::ApiKey {
+                api_key: "sk-test".into(),
+            },
+        });
+
+        let target = cfg.recovery_probe_target("account-only").unwrap();
+        assert_eq!(target.model, "account-model");
+    }
+
+    #[test]
+    fn recovery_probe_target_has_no_fake_probe_fallback() {
+        let mut cfg = base_config();
+        cfg.providers.insert(
+            "no-probe".into(),
+            ProviderConfig::OpenAi {
+                api_url: "https://no-probe.example/v1/responses".into(),
+                models_url: None,
+                endpoints: HashMap::new(),
+                models: vec!["catalog-model".into()],
+            },
+        );
+        cfg.accounts.push(AccountConfig {
+            id: "no-probe-a".into(),
+            provider: "no-probe".into(),
+            enabled: true,
+            weight: 1,
+            models: None,
+            auth: AccountAuth::ApiKey {
+                api_key: "sk-test".into(),
+            },
+        });
+
+        assert!(cfg.recovery_probe_target("no-probe").is_none());
+        assert!(cfg.recovery_probe_target("missing-provider").is_none());
     }
 }

@@ -103,41 +103,64 @@ async fn run_recovery_probe_pass(state: &AppState) {
             continue;
         };
 
-        let provider = crate::providers::get_provider(state, &account.provider);
+        let Some(target) = with_config(state.config(), |cfg| cfg.recovery_probe_target(&account.provider))
+        else {
+            state.accounts().finish_recovery_probe(index, false);
+            if !snapshot.alive {
+                warn!(
+                    "Recovery probe skipped for account index {} because provider '{}' has no configured probe target",
+                    index, account.provider
+                );
+            }
+            continue;
+        };
+
+        let provider_name = account.provider.clone();
         let route = crate::account_pool::ResolvedRoute {
-            requested_model: "__recovery_probe__".into(),
-            logical_model: "__recovery_probe__".into(),
-            upstream_model: account
-                .models
-                .as_ref()
-                .and_then(|models| models.first().cloned())
-                .or_else(|| {
-                    with_config(state.config(), |cfg| {
-                        cfg.provider_catalog(&account.provider)
-                            .and_then(|models| models.first().cloned())
-                    })
-                })
-                .unwrap_or_else(|| "__probe__".into()),
-            endpoint: None,
-            provider: account.provider.clone(),
+            requested_model: target.model.clone(),
+            logical_model: target.model.clone(),
+            upstream_model: target.model.clone(),
+            endpoint: target.endpoint.clone(),
+            provider: provider_name.clone(),
             account_index: index,
             account_id: account.id.clone(),
             cache_hit: false,
             cache_key: 0,
-            preferred_target_index: usize::MAX,
+            preferred_target_index: 0,
             reasoning: Some(crate::config::EffectiveReasoningConfig {
                 budget: 0,
                 level: "LOW".into(),
                 preset: Some("none".into()),
             }),
         };
+
+        let raw = ResponsesRequest {
+            model: target.model.clone(),
+            input: Some(crate::schema::openai::ResponsesInput::Text("health check".into())),
+            instructions: None,
+            previous_response_id: None,
+            store: Some(false),
+            metadata: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(1),
+            stream: Some(false),
+            include: None,
+        };
+        let normalized = normalizer::normalize(raw.clone());
+        let provider = crate::providers::get_provider(state, &provider_name);
         let context = ProviderExecutionContext {
             route,
             account,
             config: state.config().clone(),
             gemini_auth: state.gemini_auth(),
         };
-        let success = provider.probe_account(context).await.is_ok();
+        let success = provider
+            .handle_request(raw, normalized, HeaderMap::new(), context)
+            .await
+            .is_ok();
         state.accounts().finish_recovery_probe(index, success);
 
         if !success && !snapshot.alive {
@@ -1005,6 +1028,85 @@ fn extract_output_text(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod auto_compaction_tests {
     use super::*;
+    use crate::config::{
+        AccessControlConfig, AccountConfig, AutoCompactionConfig, CompactionConfig, Config,
+        ModelDiscoveryConfig, ModelsConfig, ModelsEndpointConfig, ProviderConfig,
+        ProviderModelMetadataConfig, ReasoningConfig, RoutingConfig, RoutingHealthConfig,
+        ServerConfig, SessionConfig, TimeoutsConfig,
+    };
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn base_test_state() -> AppState {
+        let config = Arc::new(RwLock::new(Config {
+            config_path: PathBuf::from("/tmp/config.json"),
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 8765,
+                log_level: "INFO".into(),
+                debug_mode: false,
+            },
+            providers: HashMap::from([(
+                "route-only".into(),
+                ProviderConfig::OpenAi {
+                    api_url: "https://route-only.example/v1/responses".into(),
+                    models_url: None,
+                    endpoints: HashMap::new(),
+                    models: Vec::new(),
+                },
+            )]),
+            models: ModelsConfig {
+                served: vec!["logical-route-only".into()],
+                fallback_models: HashMap::new(),
+            },
+            model_discovery: ModelDiscoveryConfig::default(),
+            model_metadata: ProviderModelMetadataConfig::new(),
+            models_endpoint: ModelsEndpointConfig::default(),
+            session: SessionConfig::default(),
+            auto_compaction: AutoCompactionConfig::default(),
+            routing: RoutingConfig {
+                model_overrides: HashMap::new(),
+                model_provider_priority: HashMap::from([(
+                    "logical-route-only".into(),
+                    vec![crate::config::RouteTargetConfig {
+                        provider: "route-only".into(),
+                        model: "real-routed-model".into(),
+                        endpoint: None,
+                        reasoning: None,
+                    }],
+                )]),
+            },
+            health: RoutingHealthConfig::default(),
+            accounts: vec![AccountConfig {
+                id: "route-only-a".into(),
+                provider: "route-only".into(),
+                enabled: true,
+                weight: 1,
+                models: None,
+                auth: crate::account_pool::AccountAuth::ApiKey {
+                    api_key: "sk-test".into(),
+                },
+            }],
+            access: AccessControlConfig::default(),
+            reasoning: ReasoningConfig::default(),
+            timeouts: TimeoutsConfig {
+                connect_seconds: 1,
+                read_seconds: 1,
+            },
+            compaction: CompactionConfig {
+                temperature: 0.1,
+                preferred_targets: Vec::new(),
+            },
+        }));
+        let state = AppState::new(config.clone());
+        state.accounts().configure_health(with_config(&config, |cfg| cfg.health.clone()));
+        state.accounts().load_accounts(with_config(&config, |cfg| {
+            cfg.accounts.clone().into_iter().map(Into::into).collect()
+        }));
+        state
+    }
 
     #[test]
     fn detects_context_length_provider_error() {
@@ -1100,6 +1202,56 @@ mod auto_compaction_tests {
         assert!(prompt.contains("do a summary"));
         assert!(prompt.contains("- user: hi"));
         assert!(prompt.contains("- assistant: hello"));
+    }
+
+    #[test]
+    fn recovery_probe_uses_configured_routed_model() {
+        let state = base_test_state();
+        let (account, _) = state.accounts().get_account(0).unwrap();
+        let target = with_config(state.config(), |cfg| {
+            cfg.recovery_probe_target(&account.provider).unwrap()
+        });
+
+        let route = crate::account_pool::ResolvedRoute {
+            requested_model: target.model.clone(),
+            logical_model: target.model.clone(),
+            upstream_model: target.model.clone(),
+            endpoint: target.endpoint.clone(),
+            provider: account.provider.clone(),
+            account_index: 0,
+            account_id: account.id.clone(),
+            cache_hit: false,
+            cache_key: 0,
+            preferred_target_index: 0,
+            reasoning: Some(crate::config::EffectiveReasoningConfig {
+                budget: 0,
+                level: "LOW".into(),
+                preset: Some("none".into()),
+            }),
+        };
+        let raw = ResponsesRequest {
+            model: target.model.clone(),
+            input: Some(crate::schema::openai::ResponsesInput::Text("health check".into())),
+            instructions: None,
+            previous_response_id: None,
+            store: Some(false),
+            metadata: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(1),
+            stream: Some(false),
+            include: None,
+        };
+        let normalized = normalizer::normalize(raw.clone());
+
+        assert_eq!(target.model, "real-routed-model");
+        assert_eq!(route.upstream_model, "real-routed-model");
+        assert_eq!(raw.model, "real-routed-model");
+        assert_eq!(normalized.model, "real-routed-model");
+        assert!(!raw.model.contains("__probe__"));
+        assert!(!route.upstream_model.contains("__probe__"));
     }
 }
 
