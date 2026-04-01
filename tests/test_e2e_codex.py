@@ -1,13 +1,14 @@
 """E2E tests: codex CLI → codex-proxy (Rust binary) → upstream provider.
 
 These tests spawn the compiled Rust proxy binary on a random port, generate a
-dedicated codex config.toml that points at that proxy, then run `codex exec`
-to verify the full request path works for Python and Rust coding tasks.
+Codex config.toml from the shared template under config/codex/, then run
+`codex exec` to verify the full request path works for Python and Rust coding
+tasks.
 
 Prerequisites:
     - `codex` binary in PATH (codex-cli >= 0.117.0)
     - Rust proxy binary at `target/debug/codex-proxy`
-    - Valid Gemini/Z.AI credentials (for actual provider calls)
+    - Valid Z.AI credentials for the configured local account
 
 Marked with pytest.mark.e2e_codex so they can be run selectively.
 """
@@ -29,8 +30,9 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUST_BINARY = PROJECT_ROOT / "target" / "debug" / "codex-proxy"
-TEMPLATE_CONFIG = Path(__file__).resolve().parent / "e2e_codex_config.toml"
+TEMPLATE_CONFIG = PROJECT_ROOT / "config" / "codex" / "config.e2e.toml"
 CODEX_BIN = shutil.which("codex")
+E2E_PROXY_KEY = "cpk_e2e_admin_local"
 
 CODEX_TIMEOUT = 180  # seconds — generous for real provider round-trips
 
@@ -47,15 +49,15 @@ def _build_codex_config(
     """Write a codex config.toml that routes through the proxy on *port*."""
     template = TEMPLATE_CONFIG.read_text()
     rendered = template.replace("{port}", str(port)).replace(
-        'model = "glm-5-turbo"', f'model = "{model}"'
+        'model = "glm-5-turbo"', f'model = "{model}"', 1
     )
     config_path.write_text(rendered)
 
 
 def _wait_for_proxy(port: int, timeout: float = 15.0) -> None:
     """Poll until the proxy responds on the health/root endpoint."""
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     deadline = time.monotonic() + timeout
     url = f"http://127.0.0.1:{port}/"
@@ -65,9 +67,64 @@ def _wait_for_proxy(port: int, timeout: float = 15.0) -> None:
             with urllib.request.urlopen(req, timeout=2) as resp:
                 if resp.status == 200:
                     return
-        except ConnectionRefusedError, urllib.error.URLError, OSError:
+        except ConnectionRefusedError:
+            time.sleep(0.3)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 200:
+                return
+            time.sleep(0.3)
+        except (urllib.error.URLError, OSError):
             time.sleep(0.3)
     raise TimeoutError(f"Proxy did not start on port {port} within {timeout}s")
+
+
+def _load_project_env() -> dict[str, str]:
+    """Load .env from project root without overriding the current process env."""
+    env = os.environ.copy()
+    env_path = PROJECT_ROOT / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                env.setdefault(key.strip(), value.strip())
+    return env
+
+
+def _require_codex_cli_support(codex_binary: str) -> None:
+    """Fail fast if the installed Codex CLI no longer matches this harness."""
+    version = subprocess.run(
+        [codex_binary, "--version"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        cwd=str(PROJECT_ROOT),
+    )
+    if version.returncode != 0:
+        pytest.skip(f"Unable to read `codex --version`: {version.stderr.strip()}")
+
+    help_result = subprocess.run(
+        [codex_binary, "exec", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        cwd=str(PROJECT_ROOT),
+    )
+    if help_result.returncode != 0:
+        pytest.skip(f"Unable to read `codex exec --help`: {help_result.stderr.strip()}")
+
+    help_text = help_result.stdout
+    required_flags = [
+        "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-c, --config <key=value>",
+    ]
+    missing = [flag for flag in required_flags if flag not in help_text]
+    if missing:
+        pytest.skip(
+            "Installed Codex CLI no longer supports required e2e flags: "
+            + ", ".join(missing)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -77,9 +134,10 @@ def _wait_for_proxy(port: int, timeout: float = 15.0) -> None:
 
 @pytest.fixture(scope="module")
 def codex_binary():
-    """Skip the whole module if codex is not available."""
+    """Skip the whole module if codex is not available or CLI flags changed."""
     if not CODEX_BIN:
         pytest.skip("codex binary not found in PATH")
+    _require_codex_cli_support(CODEX_BIN)
     yield CODEX_BIN
 
 
@@ -94,31 +152,33 @@ def rust_binary():
 
 
 @pytest.fixture(scope="module")
-def proxy_port(rust_binary):
-    """Start the Rust proxy on a random port, return the port number."""
-    # Load .env from project root to pick up provider credentials
-    env_path = PROJECT_ROOT / ".env"
-    env = os.environ.copy()
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                env[key.strip()] = value.strip()
-
-    # Map .env keys to the env var names the Rust binary expects
-    if "ZAI_API_KEY" in env and "CODEX_PROXY_ZAI_API_KEY" not in env:
+def proxy_env():
+    """Environment for launching the proxy from the repo root."""
+    env = _load_project_env()
+    if "CODEX_PROXY_ZAI_API_KEY" not in env and "ZAI_API_KEY" in env:
         env["CODEX_PROXY_ZAI_API_KEY"] = env["ZAI_API_KEY"]
-
-    port = _free_port()
-    env["CODEX_PROXY_PORT"] = str(port)
+    if not env.get("CODEX_PROXY_ZAI_API_KEY"):
+        pytest.skip(
+            "Z.AI credentials not found. Set CODEX_PROXY_ZAI_API_KEY or ZAI_API_KEY."
+        )
     env["CODEX_PROXY_LOG_LEVEL"] = "info"
+    return env
+
+
+@pytest.fixture(scope="module")
+def proxy_port(rust_binary, proxy_env):
+    """Start the Rust proxy on a random port, return the port number."""
+    port = _free_port()
+    env = proxy_env.copy()
+    env["CODEX_PROXY_PORT"] = str(port)
 
     proc = subprocess.Popen(
         [str(rust_binary)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env,
+        cwd=str(PROJECT_ROOT),
+        text=True,
     )
     try:
         _wait_for_proxy(port)
@@ -141,9 +201,19 @@ def codex_config_dir(proxy_port, tmp_path_factory):
     return config_dir
 
 
+@pytest.fixture(scope="module")
+def codex_env(codex_config_dir, proxy_env):
+    """Environment for Codex subprocesses."""
+    env = proxy_env.copy()
+    env["CODEX_HOME"] = str(codex_config_dir)
+    env["CODEX_PROXY_API_KEY"] = E2E_PROXY_KEY
+    return env
+
+
 def _run_codex(
     codex_binary: str,
     config_dir: Path,
+    codex_env: dict[str, str],
     prompt: str,
     workdir: Path,
     model: str | None = None,
@@ -164,16 +234,13 @@ def _run_codex(
         cmd.extend(["-c", f'model="{model}"'])
     cmd.append(prompt)
 
-    env = os.environ.copy()
-    env["CODEX_HOME"] = str(config_dir)
-
     return subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         timeout=timeout,
         cwd=str(workdir),
-        env=env,
+        env=codex_env,
     )
 
 
@@ -182,10 +249,43 @@ def _run_codex(
 # ---------------------------------------------------------------------------
 
 
+class TestPreflight:
+    """Check the shared config path and auth wiring before longer scenarios."""
+
+    def test_shared_template_exists(self):
+        assert TEMPLATE_CONFIG.exists(), f"Missing shared Codex template: {TEMPLATE_CONFIG}"
+        template = TEMPLATE_CONFIG.read_text()
+        assert 'env_key = "CODEX_PROXY_API_KEY"' in template
+        assert 'requires_openai_auth = false' in template
+        assert '{port}' in template
+
+    def test_codex_proxy_smoke(self, codex_binary, codex_config_dir, codex_env, tmp_path):
+        workdir = tmp_path / "smoke"
+        workdir.mkdir()
+
+        result = _run_codex(
+            codex_binary,
+            codex_config_dir,
+            codex_env,
+            "Create a file called smoke.txt containing exactly OK and nothing else. Do not run any extra commands.",
+            workdir,
+            timeout=90,
+        )
+
+        smoke_file = workdir / "smoke.txt"
+        assert smoke_file.exists(), (
+            f"smoke.txt was not created.\n"
+            f"stdout: {result.stdout[-2000:]}\n"
+            f"stderr: {result.stderr[-2000:]}\n"
+            f"returncode: {result.returncode}"
+        )
+        assert smoke_file.read_text().strip() == "OK"
+
+
 class TestPythonCoding:
     """Verify codex can complete a Python coding task through the proxy."""
 
-    def test_python_hello_world(self, codex_binary, codex_config_dir, tmp_path):
+    def test_python_hello_world(self, codex_binary, codex_config_dir, codex_env, tmp_path):
         """Ask codex to write a simple Python script, verify the file exists."""
         workdir = tmp_path / "python_test"
         workdir.mkdir()
@@ -193,12 +293,12 @@ class TestPythonCoding:
         result = _run_codex(
             codex_binary,
             codex_config_dir,
+            codex_env,
             "Create a file called hello.py that prints 'Hello from codex-proxy e2e' and nothing else. Do not run it.",
             workdir,
         )
 
         hello_py = workdir / "hello.py"
-        # Log output for debugging on failure
         if not hello_py.exists():
             pytest.fail(
                 f"hello.py was not created.\n"
@@ -214,7 +314,7 @@ class TestPythonCoding:
             f"stdout: {result.stdout[-500:]}"
         )
 
-    def test_python_with_test(self, codex_binary, codex_config_dir, tmp_path):
+    def test_python_with_test(self, codex_binary, codex_config_dir, codex_env, tmp_path):
         """Ask codex to write a Python module + test, then run the test."""
         workdir = tmp_path / "python_with_test"
         workdir.mkdir()
@@ -222,6 +322,7 @@ class TestPythonCoding:
         result = _run_codex(
             codex_binary,
             codex_config_dir,
+            codex_env,
             textwrap.dedent("""\
                 Write a Python module `adder.py` with a function `add(a, b)` that returns a + b.
                 Then write a test file `test_adder.py` that tests add() with at least 3 cases.
@@ -244,7 +345,6 @@ class TestPythonCoding:
         content = module_file.read_text()
         assert "def add" in content
 
-        # Verify tests pass independently
         test_result = subprocess.run(
             [sys.executable, "-m", "pytest", "test_adder.py", "-v"],
             capture_output=True,
@@ -262,7 +362,7 @@ class TestPythonCoding:
 class TestRustCoding:
     """Verify codex can complete a Rust coding task through the proxy."""
 
-    def test_rust_hello_world(self, codex_binary, codex_config_dir, tmp_path):
+    def test_rust_hello_world(self, codex_binary, codex_config_dir, codex_env, tmp_path):
         """Ask codex to init a minimal Rust project and verify Cargo.toml."""
         workdir = tmp_path / "rust_test"
         workdir.mkdir()
@@ -270,6 +370,7 @@ class TestRustCoding:
         result = _run_codex(
             codex_binary,
             codex_config_dir,
+            codex_env,
             "Run `cargo init --name e2e_test` in the current directory. That is the only thing you need to do.",
             workdir,
             timeout=60,
@@ -287,7 +388,7 @@ class TestRustCoding:
         content = cargo_toml.read_text()
         assert "e2e_test" in content
 
-    def test_rust_simple_lib(self, codex_binary, codex_config_dir, tmp_path):
+    def test_rust_simple_lib(self, codex_binary, codex_config_dir, codex_env, tmp_path):
         """Ask codex to write a Rust lib function and run tests."""
         workdir = tmp_path / "rust_lib_test"
         workdir.mkdir()
@@ -295,6 +396,7 @@ class TestRustCoding:
         result = _run_codex(
             codex_binary,
             codex_config_dir,
+            codex_env,
             textwrap.dedent("""\
                 Initialize a Rust library project with `cargo init --lib --name mathlib`.
                 In src/lib.rs, implement a public function `multiply(a: i32, b: i32) -> i32` that returns a * b.
@@ -318,7 +420,6 @@ class TestRustCoding:
         content = lib_rs.read_text()
         assert "multiply" in content
 
-        # Verify Rust tests pass independently
         test_result = subprocess.run(
             ["cargo", "test"],
             capture_output=True,
@@ -336,15 +437,15 @@ class TestRustCoding:
 class TestMultiTurn:
     """Verify multi-turn interaction (conversation chaining) through the proxy."""
 
-    def test_python_two_turns(self, codex_binary, codex_config_dir, tmp_path):
+    def test_python_two_turns(self, codex_binary, codex_config_dir, codex_env, tmp_path):
         """First turn: create a file. Second turn: modify it."""
         workdir = tmp_path / "multi_turn"
         workdir.mkdir()
 
-        # Turn 1
         result1 = _run_codex(
             codex_binary,
             codex_config_dir,
+            codex_env,
             "Create a file `counter.py` with a class Counter that has increment() and get() methods.",
             workdir,
         )
@@ -353,10 +454,10 @@ class TestMultiTurn:
             f"counter.py not created in turn 1.\nstdout: {result1.stdout[-1000:]}"
         )
 
-        # Turn 2 — verify codex can see the file created in turn 1
         result2 = _run_codex(
             codex_binary,
             codex_config_dir,
+            codex_env,
             "Read counter.py and add a reset() method to the Counter class.",
             workdir,
         )

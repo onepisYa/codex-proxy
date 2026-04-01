@@ -255,7 +255,7 @@ async fn models_handler(
     let (served, targets, metadata, source) = with_config(state.config(), |cfg| {
         (
             cfg.models.served.clone(),
-            cfg.routing.preferred_models.clone(),
+            cfg.routing.model_provider_priority.clone(),
             cfg.model_metadata.clone(),
             cfg.models_endpoint.source,
         )
@@ -316,7 +316,8 @@ async fn models_handler(
     if source == crate::config::ModelsEndpointSource::Served
         || source == crate::config::ModelsEndpointSource::Both
     {
-        for logical_model in served {
+        for served_model in served {
+            let logical_model = with_config(state.config(), |cfg| cfg.resolve_logical_model(&served_model));
             let routing_targets = targets.get(&logical_model).cloned().unwrap_or_default();
             let default_target = routing_targets.first().cloned();
             let default_target_metadata = default_target.as_ref().and_then(|target| {
@@ -326,12 +327,13 @@ async fn models_handler(
             });
 
             out.insert(
-                logical_model.clone(),
+                served_model.clone(),
                 json!({
-                    "id": logical_model,
+                    "id": served_model,
                     "object": "model",
                     "owned_by": "codex-proxy",
                     "metadata": {
+                        "logical_model": logical_model,
                         "routing_targets": routing_targets,
                         "default_target": default_target,
                         "default_target_metadata": default_target_metadata,
@@ -1247,7 +1249,7 @@ async fn api_config_put(
 ) -> Result<Json<serde_json::Value>, ProxyError> {
     authenticate_admin(&state, &headers)?;
     let config_path = with_config(state.config(), |cfg| cfg.config_path.clone());
-    let next = data.into_runtime(config_path.clone());
+    let mut next = data.into_runtime(config_path.clone());
     next.validate().map_err(ProxyError::Config)?;
     next.save_to_path(&config_path)
         .map_err(ProxyError::Config)?;
@@ -1384,6 +1386,7 @@ async fn api_access_keys_create(
         cfg.access.keys.push(crate::config::AccessKeyConfig {
             id: key_id.clone(),
             key_sha256: sha.clone(),
+            plaintext: None,
             name,
             enabled,
             role: Some(role),

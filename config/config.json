@@ -39,8 +39,12 @@
     "fallback_models": {}
   },
   "routing": {
-    "model_overrides": {},
-    "preferred_models": {},
+    "model_overrides": {
+      "*": "glm-5-turbo"
+    },
+    "model_provider_priority": {
+      "glm-5-turbo": []
+    },
     "sticky_routing": {
       "enabled": true
     },

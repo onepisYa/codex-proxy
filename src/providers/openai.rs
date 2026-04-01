@@ -442,7 +442,7 @@ mod tests {
             auto_compaction: crate::config::AutoCompactionConfig::default(),
             routing: RoutingConfig {
                 model_overrides: HashMap::new(),
-                preferred_models: HashMap::new(),
+                model_provider_priority: HashMap::new(),
                 sticky_routing: StickyRoutingConfig::default(),
                 health: RoutingHealthConfig::default(),
             },

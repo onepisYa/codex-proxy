@@ -31,25 +31,32 @@ cargo run --release
 
 ## Codex configuration
 
-Example `~/.codex/config.toml`:
+Example `~/.codex/config.toml`: see `config/codex/config.toml`.
 
 ```toml
-model = "claude-sonnet-4-6"
+model = "glm-5-turbo"
 model_provider = "codex-proxy"
-personality = "pragmatic"
 service_tier = "fast"
+disable_response_storage = true
+personality = "pragmatic"
 
 [model_providers.codex-proxy]
 name = "openai"
 base_url = "http://127.0.0.1:8765/v1"
 wire_api = "responses"
-api_key = "dummy"
 requires_openai_auth = false
+env_key = "CODEX_PROXY_API_KEY"
 ```
+
+The UI-generated Codex config uses the same `CODEX_PROXY_API_KEY` pattern.
 
 ## Configuration
 
-Configuration lives at `~/.config/codex-proxy/config.json`.
+Configuration search order is:
+
+1. `config/config.json.local`
+2. `~/.config/codex-proxy/config.json`
+3. `config/config.json`
 
 Top-level sections:
 
@@ -100,7 +107,7 @@ Top-level sections:
     "model_overrides": {
       "claude-fast": "claude-sonnet-4-6"
     },
-    "preferred_models": {
+    "model_provider_priority": {
       "claude-sonnet-4-6": [
         {
           "provider": "open_ai",
@@ -185,7 +192,7 @@ Top-level sections:
 
 ### Routing model
 
-- `routing.preferred_models[logical_model]` is an ordered list of route targets.
+- `routing.model_provider_priority[logical_model]` is an ordered list of route targets.
 - Each route target picks one upstream provider and one upstream model.
 - Sticky routing reuses the exact chosen `(provider, model, account)` path when it is still healthy.
 - If the sticky-bound path is unhealthy, routing falls through to the next compatible preferred target.
@@ -207,7 +214,7 @@ Top-level sections:
 - `accounts[]` is the source of truth for upstream credentials.
 - Gemini supports either `api_key` or `gemini_oauth` account auth.
 - Z.AI and OpenAI currently use straightforward account-scoped API-key auth.
-- `routing.model_overrides` maps user-facing requested models to logical routing entries.
+- `routing.model_overrides` maps user-facing requested models to logical routing entries. Exact matches win first, then a literal `"*"` wildcard applies, otherwise the requested model is used unchanged.
 - Compaction uses the same ordered route planning path as normal responses, but with `compaction.preferred_targets`.
 - The OpenAI provider intentionally forwards requests upstream with minimal transformation: it swaps in the resolved upstream model and configured account auth, then forwards the OpenAI-shaped payload.
 

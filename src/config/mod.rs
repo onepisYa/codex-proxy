@@ -556,8 +556,8 @@ pub struct RoutingHealthConfig {
 pub struct RoutingConfig {
     #[serde(default)]
     pub model_overrides: HashMap<String, String>,
-    #[serde(default)]
-    pub preferred_models: HashMap<String, Vec<RouteTargetConfig>>,
+    #[serde(default, alias = "preferred_models")]
+    pub model_provider_priority: HashMap<String, Vec<RouteTargetConfig>>,
     #[serde(default)]
     pub sticky_routing: StickyRoutingConfig,
     #[serde(default)]
@@ -596,7 +596,10 @@ pub enum AccessKeyRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessKeyConfig {
     pub id: String,
+    #[serde(default)]
     pub key_sha256: String,
+    #[serde(default, skip_serializing)]
+    pub plaintext: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default = "default_true")]
@@ -616,6 +619,29 @@ impl AccessKeyConfig {
                 AccessKeyRole::Api
             }
         })
+    }
+
+    pub fn normalize_secret(&mut self) -> Result<(), ConfigError> {
+        let has_hash = !self.key_sha256.trim().is_empty();
+        let plaintext = self.plaintext.as_deref().unwrap_or("").trim();
+        let has_plaintext = !plaintext.is_empty();
+
+        match (has_hash, has_plaintext) {
+            (true, true) => Err(ConfigError::InvalidValue(format!(
+                "access.keys['{}'] must set only one of key_sha256 or plaintext",
+                self.id
+            ))),
+            (false, false) => Err(ConfigError::InvalidValue(format!(
+                "access.keys['{}'] must set key_sha256 or plaintext",
+                self.id
+            ))),
+            (false, true) => {
+                self.key_sha256 = crate::access::sha256_hex(plaintext);
+                self.plaintext = None;
+                Ok(())
+            }
+            (true, false) => Ok(()),
+        }
     }
 }
 
@@ -693,7 +719,10 @@ pub struct PersistedConfig {
 }
 
 impl PersistedConfig {
-    pub fn into_runtime(self, config_path: PathBuf) -> Config {
+    pub fn into_runtime(mut self, config_path: PathBuf) -> Config {
+        for key in &mut self.access.keys {
+            key.plaintext = None;
+        }
         Config {
             config_path,
             server: self.server,
@@ -917,7 +946,7 @@ impl Config {
             auto_compaction: AutoCompactionConfig::default(),
             routing: RoutingConfig {
                 model_overrides: HashMap::new(),
-                preferred_models: HashMap::new(),
+                model_provider_priority: HashMap::new(),
                 sticky_routing: StickyRoutingConfig::default(),
                 health: RoutingHealthConfig::default(),
             },
@@ -1045,7 +1074,7 @@ impl Config {
         Ok(())
     }
 
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&mut self) -> Result<(), ConfigError> {
         if self.providers.is_empty() {
             return Err(ConfigError::InvalidValue(
                 "providers must contain at least one provider entry".into(),
@@ -1120,7 +1149,7 @@ impl Config {
 
         let mut seen_access_ids = HashSet::new();
         let mut enabled_access_key_count = 0usize;
-        for key in &self.access.keys {
+        for key in &mut self.access.keys {
             if !seen_access_ids.insert(key.id.clone()) {
                 return Err(ConfigError::InvalidValue(format!(
                     "duplicate access key id: {}",
@@ -1130,6 +1159,7 @@ impl Config {
             if key.enabled {
                 enabled_access_key_count += 1;
             }
+            key.normalize_secret()?;
             let hash = key.key_sha256.trim();
             let is_hex_64 = hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit());
             if !is_hex_64 {
@@ -1222,22 +1252,22 @@ impl Config {
             }
         }
 
-        for (logical_model, targets) in &self.routing.preferred_models {
+        for (logical_model, targets) in &self.routing.model_provider_priority {
             if targets.is_empty() {
                 return Err(ConfigError::InvalidValue(format!(
-                    "routing.preferred_models['{}'] must not be empty",
+                    "routing.model_provider_priority['{}'] must not be empty",
                     logical_model
                 )));
             }
             for target in targets {
                 self.validate_route_target(
                     target,
-                    &format!("routing.preferred_models['{}']", logical_model),
+                    &format!("routing.model_provider_priority['{}']", logical_model),
                 )?;
             }
             if !self.has_compatible_enabled_account(targets) {
                 return Err(ConfigError::InvalidValue(format!(
-                    "routing.preferred_models['{}'] has no compatible enabled account",
+                    "routing.model_provider_priority['{}'] has no compatible enabled account",
                     logical_model
                 )));
             }
@@ -1254,11 +1284,11 @@ impl Config {
             }
         }
 
-        for mapped_model in self.routing.model_overrides.values() {
-            if !self.routing.preferred_models.contains_key(mapped_model) {
+        for (requested_model, mapped_model) in &self.routing.model_overrides {
+            if !self.routing.model_provider_priority.contains_key(mapped_model) {
                 return Err(ConfigError::InvalidValue(format!(
-                    "routing.model_overrides target '{}' is not defined in routing.preferred_models",
-                    mapped_model
+                    "routing.model_overrides['{}'] target '{}' is not defined in routing.model_provider_priority",
+                    requested_model, mapped_model
                 )));
             }
         }
@@ -1266,9 +1296,9 @@ impl Config {
         if !self.models.served.is_empty() {
             for served_model in &self.models.served {
                 let logical_model = self.resolve_logical_model(served_model);
-                if !self.routing.preferred_models.contains_key(&logical_model) {
+                if !self.routing.model_provider_priority.contains_key(&logical_model) {
                     return Err(ConfigError::InvalidValue(format!(
-                        "served model '{}' resolves to logical model '{}' but no routing.preferred_models entry exists",
+                        "served model '{}' resolves to logical model '{}' but no routing.model_provider_priority entry exists",
                         served_model, logical_model
                     )));
                 }
@@ -1282,6 +1312,7 @@ impl Config {
         self.routing
             .model_overrides
             .get(requested_model)
+            .or_else(|| self.routing.model_overrides.get("*"))
             .cloned()
             .unwrap_or_else(|| requested_model.to_string())
     }
@@ -1292,7 +1323,7 @@ impl Config {
     ) -> Option<&[RouteTargetConfig]> {
         let logical_model = self.resolve_logical_model(requested_model);
         self.routing
-            .preferred_models
+            .model_provider_priority
             .get(&logical_model)
             .map(Vec::as_slice)
     }
@@ -1564,7 +1595,7 @@ mod tests {
             auto_compaction: AutoCompactionConfig::default(),
             routing: RoutingConfig {
                 model_overrides: HashMap::new(),
-                preferred_models: HashMap::from([(
+                model_provider_priority: HashMap::from([(
                     "claude-sonnet-4-6".into(),
                     vec![RouteTargetConfig {
                         provider: "tabcode".into(),
@@ -1614,7 +1645,7 @@ mod tests {
 
     #[test]
     fn validates_capability_routing_config() {
-        let cfg = base_config();
+        let mut cfg = base_config();
         assert!(cfg.validate().is_ok());
     }
 
@@ -1629,7 +1660,7 @@ mod tests {
     #[test]
     fn resolves_effective_reasoning_from_preset_override() {
         let cfg = base_config();
-        let target = &cfg.routing.preferred_models["claude-sonnet-4-6"][0];
+        let target = &cfg.routing.model_provider_priority["claude-sonnet-4-6"][0];
         let reasoning = cfg
             .resolve_reasoning(target.reasoning.as_ref())
             .unwrap()
@@ -1650,5 +1681,66 @@ mod tests {
         let mut cfg = base_config();
         cfg.compaction.preferred_targets = Vec::new();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn deserialize_legacy_preferred_models_alias() {
+        let routing: RoutingConfig = serde_json::from_value(serde_json::json!({
+            "preferred_models": {
+                "claude-sonnet-4-6": [
+                    { "provider": "tabcode", "model": "gpt-4.1" }
+                ]
+            }
+        }))
+        .unwrap();
+
+        assert!(routing.model_provider_priority.contains_key("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn serializes_routing_with_new_field_name_only() {
+        let cfg = base_config();
+        let value = serde_json::to_value(&cfg.routing).unwrap();
+
+        assert!(value.get("model_provider_priority").is_some());
+        assert!(value.get("preferred_models").is_none());
+    }
+
+    #[test]
+    fn exact_model_override_beats_wildcard() {
+        let mut cfg = base_config();
+        cfg.routing.model_overrides = HashMap::from([
+            ("*".into(), "fallback-logical".into()),
+            ("claude-sonnet-4-6".into(), "exact-logical".into()),
+        ]);
+
+        assert_eq!(cfg.resolve_logical_model("claude-sonnet-4-6"), "exact-logical");
+    }
+
+    #[test]
+    fn wildcard_model_override_applies_when_exact_is_missing() {
+        let mut cfg = base_config();
+        cfg.routing.model_overrides = HashMap::from([("*".into(), "claude-sonnet-4-6".into())]);
+
+        assert_eq!(cfg.resolve_logical_model("unmapped-model"), "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn wildcard_override_target_must_exist_in_model_provider_priority() {
+        let mut cfg = base_config();
+        cfg.routing.model_overrides = HashMap::from([("*".into(), "missing-logical".into())]);
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("routing.model_overrides['*'] target 'missing-logical' is not defined in routing.model_provider_priority"));
+    }
+
+    #[test]
+    fn preferred_targets_use_wildcard_resolved_logical_model() {
+        let mut cfg = base_config();
+        cfg.routing.model_overrides = HashMap::from([("*".into(), "claude-sonnet-4-6".into())]);
+
+        let targets = cfg.preferred_targets_for_model("unmapped-model").unwrap();
+        assert_eq!(targets[0].provider, "tabcode");
+        assert_eq!(targets[0].model, "gpt-4.1");
     }
 }
