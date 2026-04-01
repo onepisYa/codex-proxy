@@ -23,6 +23,7 @@ async-stream = "0.3"
 bytes = "1"
 rand = "0.8"
 sha2 = "0.10"
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 3

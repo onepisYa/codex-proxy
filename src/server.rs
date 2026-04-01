@@ -103,8 +103,9 @@ async fn run_recovery_probe_pass(state: &AppState) {
             continue;
         };
 
-        let Some(target) = with_config(state.config(), |cfg| cfg.recovery_probe_target(&account.provider))
-        else {
+        let Some(target) = with_config(state.config(), |cfg| {
+            cfg.recovery_probe_target(&account.provider)
+        }) else {
             state.accounts().finish_recovery_probe(index, false);
             if !snapshot.alive {
                 warn!(
@@ -136,7 +137,9 @@ async fn run_recovery_probe_pass(state: &AppState) {
 
         let raw = ResponsesRequest {
             model: target.model.clone(),
-            input: Some(crate::schema::openai::ResponsesInput::Text("health check".into())),
+            input: Some(crate::schema::openai::ResponsesInput::Text(
+                "health check".into(),
+            )),
             instructions: None,
             previous_response_id: None,
             store: Some(false),
@@ -270,107 +273,101 @@ async fn favicon_handler() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct PublicModelPricingDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_per_mtoken: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_per_mtoken: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct PublicModelDto {
+    id: String,
+    object: &'static str,
+    owned_by: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pricing: Option<PublicModelPricingDto>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct PublicModelsListDto {
+    object: &'static str,
+    data: Vec<PublicModelDto>,
+}
+
+fn project_public_pricing(
+    pricing: &crate::config::ModelPricingConfig,
+) -> Option<PublicModelPricingDto> {
+    let projected = PublicModelPricingDto {
+        input_per_mtoken: pricing.input_per_mtoken,
+        output_per_mtoken: pricing.output_per_mtoken,
+    };
+    (projected.input_per_mtoken.is_some() || projected.output_per_mtoken.is_some())
+        .then_some(projected)
+}
+
+fn project_public_model_metadata(
+    metadata: &crate::config::ModelMetadataConfig,
+) -> Option<PublicModelDto> {
+    let projected = PublicModelDto {
+        id: String::new(),
+        object: "model",
+        owned_by: "codex-proxy",
+        context_window: metadata.context_window,
+        max_output_tokens: metadata.max_output_tokens,
+        pricing: metadata.pricing.as_ref().and_then(project_public_pricing),
+    };
+    (projected.context_window.is_some()
+        || projected.max_output_tokens.is_some()
+        || projected.pricing.is_some())
+    .then_some(projected)
+}
+
+fn public_model_from_config(cfg: &crate::config::Config, served_model: &str) -> PublicModelDto {
+    let logical_model = cfg.resolve_logical_model(served_model);
+    let projected = cfg
+        .preferred_targets_for_model(served_model)
+        .and_then(|targets| targets.first())
+        .and_then(|target| cfg.model_metadata(&target.provider, &target.model))
+        .and_then(project_public_model_metadata)
+        .unwrap_or_default();
+
+    let _ = logical_model;
+
+    PublicModelDto {
+        id: served_model.to_string(),
+        object: "model",
+        owned_by: "codex-proxy",
+        context_window: projected.context_window,
+        max_output_tokens: projected.max_output_tokens,
+        pricing: projected.pricing,
+    }
+}
+
+fn build_public_models_response(cfg: &crate::config::Config) -> PublicModelsListDto {
+    PublicModelsListDto {
+        object: "list",
+        data: cfg
+            .models
+            .served
+            .iter()
+            .map(|served_model| public_model_from_config(cfg, served_model))
+            .collect(),
+    }
+}
+
 async fn models_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, ProxyError> {
+) -> Result<Json<PublicModelsListDto>, ProxyError> {
     let _ = crate::access::authenticate_request(state.config(), &headers)?;
-    let (served, targets, metadata, source) = with_config(state.config(), |cfg| {
-        (
-            cfg.models.served.clone(),
-            cfg.routing.model_provider_priority.clone(),
-            cfg.model_metadata.clone(),
-            cfg.models_endpoint.source,
-        )
-    });
-
-    use std::collections::{BTreeMap, BTreeSet};
-
-    #[derive(Default)]
-    struct DiscoveredModel {
-        providers: BTreeSet<String>,
-    }
-
-    let mut out: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-
-    if source == crate::config::ModelsEndpointSource::Discovered
-        || source == crate::config::ModelsEndpointSource::Both
-    {
-        let mut discovered: BTreeMap<String, DiscoveredModel> = BTreeMap::new();
-        for snapshot in state.model_catalog().snapshot() {
-            for model_id in snapshot.models {
-                discovered
-                    .entry(model_id)
-                    .or_default()
-                    .providers
-                    .insert(snapshot.provider.clone());
-            }
-        }
-
-        for (model_id, item) in discovered {
-            let providers: Vec<String> = item.providers.into_iter().collect();
-            let mut provider_metadata = Vec::new();
-            for provider in &providers {
-                let meta = metadata
-                    .get(provider)
-                    .and_then(|models| models.get(&model_id));
-                provider_metadata.push(json!({
-                    "provider": provider,
-                    "metadata": meta,
-                }));
-            }
-
-            out.insert(
-                model_id.clone(),
-                json!({
-                    "id": model_id,
-                    "object": "model",
-                    "owned_by": "codex-proxy",
-                    "metadata": {
-                        "providers": providers,
-                        "provider_metadata": provider_metadata,
-                        "served": false,
-                    }
-                }),
-            );
-        }
-    }
-
-    if source == crate::config::ModelsEndpointSource::Served
-        || source == crate::config::ModelsEndpointSource::Both
-    {
-        for served_model in served {
-            let logical_model = with_config(state.config(), |cfg| cfg.resolve_logical_model(&served_model));
-            let routing_targets = targets.get(&logical_model).cloned().unwrap_or_default();
-            let default_target = routing_targets.first().cloned();
-            let default_target_metadata = default_target.as_ref().and_then(|target| {
-                metadata
-                    .get(&target.provider)
-                    .and_then(|models| models.get(&target.model))
-            });
-
-            out.insert(
-                served_model.clone(),
-                json!({
-                    "id": served_model,
-                    "object": "model",
-                    "owned_by": "codex-proxy",
-                    "metadata": {
-                        "logical_model": logical_model,
-                        "routing_targets": routing_targets,
-                        "default_target": default_target,
-                        "default_target_metadata": default_target_metadata,
-                        "served": true,
-                    }
-                }),
-            );
-        }
-    }
-
-    Ok(Json(json!({
-        "object": "list",
-        "data": out.into_values().collect::<Vec<_>>(),
-    })))
+    let response = with_config(state.config(), build_public_models_response);
+    Ok(Json(response))
 }
 
 async fn api_models_get(
@@ -1029,18 +1026,21 @@ fn extract_output_text(value: &serde_json::Value) -> Option<String> {
 mod auto_compaction_tests {
     use super::*;
     use crate::config::{
-        AccessControlConfig, AccountConfig, AutoCompactionConfig, CompactionConfig, Config,
-        ModelDiscoveryConfig, ModelsConfig, ModelsEndpointConfig, ProviderConfig,
-        ProviderModelMetadataConfig, ReasoningConfig, RoutingConfig, RoutingHealthConfig,
-        ServerConfig, SessionConfig, TimeoutsConfig,
+        AccessControlConfig, AccessKeyConfig, AccessKeyRole, AccountConfig, AutoCompactionConfig,
+        CompactionConfig, Config, ModelDiscoveryConfig, ModelMetadataConfig, ModelPricingConfig,
+        ModelsConfig, ModelsEndpointConfig, ProviderConfig, ReasoningConfig, RoutingConfig,
+        RoutingHealthConfig, ServerConfig, SessionConfig, TimeoutsConfig,
     };
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use tower::util::ServiceExt;
 
-    fn base_test_state() -> AppState {
-        let config = Arc::new(RwLock::new(Config {
+    fn test_config() -> Config {
+        Config {
             config_path: PathBuf::from("/tmp/config.json"),
             server: ServerConfig {
                 host: "127.0.0.1".into(),
@@ -1048,35 +1048,76 @@ mod auto_compaction_tests {
                 log_level: "INFO".into(),
                 debug_mode: false,
             },
-            providers: HashMap::from([(
-                "route-only".into(),
-                ProviderConfig::OpenAi {
-                    api_url: "https://route-only.example/v1/responses".into(),
-                    models_url: None,
-                    endpoints: HashMap::new(),
-                    models: Vec::new(),
-                },
-            )]),
+            providers: HashMap::from([
+                (
+                    "route-only".into(),
+                    ProviderConfig::OpenAi {
+                        api_url: "https://route-only.example/v1/responses".into(),
+                        models_url: None,
+                        endpoints: HashMap::new(),
+                        models: Vec::new(),
+                    },
+                ),
+                (
+                    "discovered-only".into(),
+                    ProviderConfig::OpenAi {
+                        api_url: "https://discovered-only.example/v1/responses".into(),
+                        models_url: None,
+                        endpoints: HashMap::new(),
+                        models: Vec::new(),
+                    },
+                ),
+            ]),
             models: ModelsConfig {
-                served: vec!["logical-route-only".into()],
+                served: vec![
+                    "logical-route-only".into(),
+                    "served-without-metadata".into(),
+                ],
                 fallback_models: HashMap::new(),
             },
-            model_discovery: ModelDiscoveryConfig::default(),
-            model_metadata: ProviderModelMetadataConfig::new(),
+            model_discovery: ModelDiscoveryConfig {
+                enabled: false,
+                interval_seconds: 300,
+            },
+            model_metadata: HashMap::from([(
+                "route-only".into(),
+                HashMap::from([(
+                    "real-routed-model".into(),
+                    ModelMetadataConfig {
+                        context_window: Some(200_000),
+                        max_output_tokens: Some(16_384),
+                        pricing: Some(ModelPricingConfig {
+                            input_per_mtoken: Some(1.25),
+                            output_per_mtoken: Some(5.0),
+                        }),
+                    },
+                )]),
+            )]),
             models_endpoint: ModelsEndpointConfig::default(),
             session: SessionConfig::default(),
             auto_compaction: AutoCompactionConfig::default(),
             routing: RoutingConfig {
                 model_overrides: HashMap::new(),
-                model_provider_priority: HashMap::from([(
-                    "logical-route-only".into(),
-                    vec![crate::config::RouteTargetConfig {
-                        provider: "route-only".into(),
-                        model: "real-routed-model".into(),
-                        endpoint: None,
-                        reasoning: None,
-                    }],
-                )]),
+                model_provider_priority: HashMap::from([
+                    (
+                        "logical-route-only".into(),
+                        vec![crate::config::RouteTargetConfig {
+                            provider: "route-only".into(),
+                            model: "real-routed-model".into(),
+                            endpoint: Some("private-endpoint".into()),
+                            reasoning: None,
+                        }],
+                    ),
+                    (
+                        "served-without-metadata".into(),
+                        vec![crate::config::RouteTargetConfig {
+                            provider: "route-only".into(),
+                            model: "unknown-upstream-model".into(),
+                            endpoint: None,
+                            reasoning: None,
+                        }],
+                    ),
+                ]),
             },
             health: RoutingHealthConfig::default(),
             accounts: vec![AccountConfig {
@@ -1089,7 +1130,29 @@ mod auto_compaction_tests {
                     api_key: "sk-test".into(),
                 },
             }],
-            access: AccessControlConfig::default(),
+            access: AccessControlConfig {
+                require_key: true,
+                keys: vec![
+                    AccessKeyConfig {
+                        id: "api-key".into(),
+                        key_sha256: crate::access::sha256_hex("api-secret"),
+                        plaintext: None,
+                        name: Some("API".into()),
+                        enabled: true,
+                        role: Some(AccessKeyRole::Api),
+                        is_admin: false,
+                    },
+                    AccessKeyConfig {
+                        id: "admin-key".into(),
+                        key_sha256: crate::access::sha256_hex("admin-secret"),
+                        plaintext: None,
+                        name: Some("Admin".into()),
+                        enabled: true,
+                        role: Some(AccessKeyRole::Admin),
+                        is_admin: false,
+                    },
+                ],
+            },
             reasoning: ReasoningConfig::default(),
             timeouts: TimeoutsConfig {
                 connect_seconds: 1,
@@ -1099,9 +1162,15 @@ mod auto_compaction_tests {
                 temperature: 0.1,
                 preferred_targets: Vec::new(),
             },
-        }));
+        }
+    }
+
+    fn base_test_state() -> AppState {
+        let config = Arc::new(RwLock::new(test_config()));
         let state = AppState::new(config.clone());
-        state.accounts().configure_health(with_config(&config, |cfg| cfg.health.clone()));
+        state
+            .accounts()
+            .configure_health(with_config(&config, |cfg| cfg.health.clone()));
         state.accounts().load_accounts(with_config(&config, |cfg| {
             cfg.accounts.clone().into_iter().map(Into::into).collect()
         }));
@@ -1231,7 +1300,9 @@ mod auto_compaction_tests {
         };
         let raw = ResponsesRequest {
             model: target.model.clone(),
-            input: Some(crate::schema::openai::ResponsesInput::Text("health check".into())),
+            input: Some(crate::schema::openai::ResponsesInput::Text(
+                "health check".into(),
+            )),
             instructions: None,
             previous_response_id: None,
             store: Some(false),
@@ -1252,6 +1323,180 @@ mod auto_compaction_tests {
         assert_eq!(normalized.model, "real-routed-model");
         assert!(!raw.model.contains("__probe__"));
         assert!(!route.upstream_model.contains("__probe__"));
+    }
+
+    #[test]
+    fn public_models_response_only_exposes_served_models_and_allowed_fields() {
+        let cfg = test_config();
+        let response = build_public_models_response(&cfg);
+        let value = serde_json::to_value(&response).unwrap();
+        let data = value
+            .get("data")
+            .and_then(|v| v.as_array())
+            .expect("models list data");
+
+        assert_eq!(data.len(), 2);
+        assert_eq!(
+            data[0].get("id").and_then(|v| v.as_str()),
+            Some("logical-route-only")
+        );
+        assert_eq!(
+            data[1].get("id").and_then(|v| v.as_str()),
+            Some("served-without-metadata")
+        );
+        assert_eq!(
+            data[0].get("object").and_then(|v| v.as_str()),
+            Some("model")
+        );
+        assert_eq!(
+            data[0].get("owned_by").and_then(|v| v.as_str()),
+            Some("codex-proxy")
+        );
+        assert_eq!(
+            data[0].get("context_window").and_then(|v| v.as_u64()),
+            Some(200_000)
+        );
+        assert_eq!(
+            data[0].get("max_output_tokens").and_then(|v| v.as_u64()),
+            Some(16_384)
+        );
+        assert_eq!(
+            data[0]
+                .get("pricing")
+                .and_then(|v| v.get("input_per_mtoken"))
+                .and_then(|v| v.as_f64()),
+            Some(1.25)
+        );
+        assert_eq!(
+            data[0]
+                .get("pricing")
+                .and_then(|v| v.get("output_per_mtoken"))
+                .and_then(|v| v.as_f64()),
+            Some(5.0)
+        );
+
+        for entry in data {
+            assert!(entry.get("logical_model").is_none());
+            assert!(entry.get("routing_targets").is_none());
+            assert!(entry.get("default_target").is_none());
+            assert!(entry.get("default_target_metadata").is_none());
+            assert!(entry.get("providers").is_none());
+            assert!(entry.get("provider_metadata").is_none());
+            assert!(entry.get("last_error").is_none());
+            assert!(entry.get("metadata").is_none());
+        }
+
+        let missing_metadata = data
+            .iter()
+            .find(|entry| {
+                entry.get("id").and_then(|v| v.as_str()) == Some("served-without-metadata")
+            })
+            .unwrap();
+        assert!(missing_metadata.get("context_window").is_none());
+        assert!(missing_metadata.get("max_output_tokens").is_none());
+        assert!(missing_metadata.get("pricing").is_none());
+        assert!(
+            data.iter()
+                .all(|entry| entry.get("id").and_then(|v| v.as_str())
+                    != Some("not-served-discovered-model"))
+        );
+    }
+
+    async fn perform_request(path: &str, key: Option<&str>) -> (StatusCode, serde_json::Value) {
+        let state = base_test_state();
+        state.model_catalog().update_success(
+            "discovered-only",
+            vec!["not-served-discovered-model".into()],
+        );
+        state
+            .model_catalog()
+            .update_error("route-only", "upstream discovery failed".into());
+
+        let mut builder = Request::builder().uri(path).method("GET");
+        if let Some(key) = key {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
+        }
+        let request = builder.body(Body::empty()).unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn non_admin_api_user_can_access_public_models_but_not_admin_models() {
+        let (public_status, public_body) = perform_request("/v1/models", Some("api-secret")).await;
+        assert_eq!(public_status, StatusCode::OK);
+        let public_data = public_body
+            .get("data")
+            .and_then(|v| v.as_array())
+            .expect("public models data");
+        assert_eq!(public_data.len(), 2);
+        assert!(
+            public_data
+                .iter()
+                .all(|entry| entry.get("metadata").is_none())
+        );
+        assert!(
+            public_data
+                .iter()
+                .all(|entry| entry.get("routing_targets").is_none())
+        );
+        assert!(
+            public_data
+                .iter()
+                .all(|entry| entry.get("id").and_then(|v| v.as_str())
+                    != Some("not-served-discovered-model"))
+        );
+
+        let (admin_status, admin_body) = perform_request("/api/models", Some("api-secret")).await;
+        assert_eq!(admin_status, StatusCode::UNAUTHORIZED);
+        assert!(
+            admin_body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("role=admin")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_can_access_admin_models_and_other_admin_endpoints() {
+        let (models_status, models_body) =
+            perform_request("/api/models", Some("admin-secret")).await;
+        assert_eq!(models_status, StatusCode::OK);
+        let providers = models_body
+            .get("providers")
+            .and_then(|v| v.as_array())
+            .expect("providers array");
+        assert!(providers.iter().any(|provider| {
+            provider.get("provider").and_then(|v| v.as_str()) == Some("discovered-only")
+                && provider
+                    .get("models")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|models| {
+                        models
+                            .iter()
+                            .any(|model| model.as_str() == Some("not-served-discovered-model"))
+                    })
+        }));
+        assert!(providers.iter().any(|provider| {
+            provider.get("provider").and_then(|v| v.as_str()) == Some("route-only")
+                && provider.get("last_error").and_then(|v| v.as_str())
+                    == Some("upstream discovery failed")
+        }));
+
+        let (config_status, _) = perform_request("/api/config", Some("admin-secret")).await;
+        let (accounts_status, _) = perform_request("/api/accounts", Some("admin-secret")).await;
+        let (usage_keys_status, _) = perform_request("/api/usage/keys", Some("admin-secret")).await;
+        let (access_keys_status, _) =
+            perform_request("/api/access-keys", Some("admin-secret")).await;
+        assert_eq!(config_status, StatusCode::OK);
+        assert_eq!(accounts_status, StatusCode::OK);
+        assert_eq!(usage_keys_status, StatusCode::OK);
+        assert_eq!(access_keys_status, StatusCode::OK);
     }
 }
 

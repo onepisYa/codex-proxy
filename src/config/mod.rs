@@ -1273,7 +1273,11 @@ impl Config {
         }
 
         for (requested_model, mapped_model) in &self.routing.model_overrides {
-            if !self.routing.model_provider_priority.contains_key(mapped_model) {
+            if !self
+                .routing
+                .model_provider_priority
+                .contains_key(mapped_model)
+            {
                 return Err(ConfigError::InvalidValue(format!(
                     "routing.model_overrides['{}'] target '{}' is not defined in routing.model_provider_priority",
                     requested_model, mapped_model
@@ -1284,7 +1288,11 @@ impl Config {
         if !self.models.served.is_empty() {
             for served_model in &self.models.served {
                 let logical_model = self.resolve_logical_model(served_model);
-                if !self.routing.model_provider_priority.contains_key(&logical_model) {
+                if !self
+                    .routing
+                    .model_provider_priority
+                    .contains_key(&logical_model)
+                {
                     return Err(ConfigError::InvalidValue(format!(
                         "served model '{}' resolves to logical model '{}' but no routing.model_provider_priority entry exists",
                         served_model, logical_model
@@ -1334,9 +1342,10 @@ impl Config {
                     .and_then(|account| {
                         account.models.as_ref().and_then(|models| {
                             models.iter().find_map(|model| {
-                                self.provider_catalog(provider).map_or(Some(model.clone()), |catalog| {
-                                    catalog.contains(model).then(|| model.clone())
-                                })
+                                self.provider_catalog(provider)
+                                    .map_or(Some(model.clone()), |catalog| {
+                                        catalog.contains(model).then(|| model.clone())
+                                    })
                             })
                         })
                     })
@@ -1350,17 +1359,22 @@ impl Config {
             .or_else(|| {
                 self.provider_catalog(provider).and_then(|catalog| {
                     catalog.iter().find_map(|model| {
-                        self.accounts.iter().any(|account| {
-                            account.enabled
-                                && account.provider == provider
-                                && account.models.as_ref().is_some_and(|models| models.contains(model))
-                        })
-                        .then(|| RouteTargetConfig {
-                            provider: provider.to_string(),
-                            model: model.clone(),
-                            endpoint: None,
-                            reasoning: None,
-                        })
+                        self.accounts
+                            .iter()
+                            .any(|account| {
+                                account.enabled
+                                    && account.provider == provider
+                                    && account
+                                        .models
+                                        .as_ref()
+                                        .is_some_and(|models| models.contains(model))
+                            })
+                            .then(|| RouteTargetConfig {
+                                provider: provider.to_string(),
+                                model: model.clone(),
+                                endpoint: None,
+                                reasoning: None,
+                            })
                     })
                 })
             })
@@ -1727,7 +1741,11 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(routing.model_provider_priority.contains_key("claude-sonnet-4-6"));
+        assert!(
+            routing
+                .model_provider_priority
+                .contains_key("claude-sonnet-4-6")
+        );
     }
 
     #[test]
@@ -1746,10 +1764,12 @@ mod tests {
         let value = serde_json::to_value(cfg.to_persisted()).unwrap();
 
         assert!(value.get("health").is_some());
-        assert!(value
-            .get("routing")
-            .and_then(|routing| routing.get("health"))
-            .is_none());
+        assert!(
+            value
+                .get("routing")
+                .and_then(|routing| routing.get("health"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1818,7 +1838,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(persisted.health.failure_threshold, 7);
-        assert!(persisted.routing.model_provider_priority.contains_key("claude-sonnet-4-6"));
+        assert!(
+            persisted
+                .routing
+                .model_provider_priority
+                .contains_key("claude-sonnet-4-6")
+        );
     }
 
     #[test]
@@ -1955,7 +1980,10 @@ mod tests {
             ("claude-sonnet-4-6".into(), "exact-logical".into()),
         ]);
 
-        assert_eq!(cfg.resolve_logical_model("claude-sonnet-4-6"), "exact-logical");
+        assert_eq!(
+            cfg.resolve_logical_model("claude-sonnet-4-6"),
+            "exact-logical"
+        );
     }
 
     #[test]
@@ -1963,7 +1991,10 @@ mod tests {
         let mut cfg = base_config();
         cfg.routing.model_overrides = HashMap::from([("*".into(), "claude-sonnet-4-6".into())]);
 
-        assert_eq!(cfg.resolve_logical_model("unmapped-model"), "claude-sonnet-4-6");
+        assert_eq!(
+            cfg.resolve_logical_model("unmapped-model"),
+            "claude-sonnet-4-6"
+        );
     }
 
     #[test]
