@@ -64,7 +64,9 @@ Top-level sections:
 - `providers`
 - `models`
 - `routing`
+- `health`
 - `accounts`
+- `auto_compaction`
 - `reasoning`
 - `timeouts`
 - `compaction`
@@ -105,7 +107,8 @@ Top-level sections:
   },
   "routing": {
     "model_overrides": {
-      "claude-fast": "claude-sonnet-4-6"
+      "claude-fast": "claude-sonnet-4-6",
+      "*": "claude-sonnet-4-6"
     },
     "model_provider_priority": {
       "claude-sonnet-4-6": [
@@ -130,12 +133,12 @@ Top-level sections:
     },
     "sticky_routing": {
       "enabled": true
-    },
-    "health": {
-      "auth_failure_immediate_unhealthy": true,
-      "failure_threshold": 3,
-      "cooldown_seconds": 60
     }
+  },
+  "health": {
+    "auth_failure_immediate_unhealthy": true,
+    "failure_threshold": 3,
+    "cooldown_seconds": 60
   },
   "accounts": [
     {
@@ -160,6 +163,13 @@ Top-level sections:
       }
     }
   ],
+  "auto_compaction": {
+    "enabled": true,
+    "max_attempts_per_request": 1,
+    "tail_items_to_keep": 8,
+    "compact_instructions": "Compact the conversation history for continued use. Preserve all tool and file context needed to continue the session.",
+    "summary_instructions": "Summarize the conversation history so far for continued use. Preserve key decisions, constraints, open tasks, file paths, and relevant technical details. Be concise but complete."
+  },
   "reasoning": {
     "default_effort": "medium",
     "effort_levels": {
@@ -192,12 +202,14 @@ Top-level sections:
 
 ### Routing model
 
-- `routing.model_provider_priority[logical_model]` is an ordered list of route targets.
+- `routing.model_provider_priority[logical_model]` is the canonical ordered list of route targets.
 - Each route target picks one upstream provider and one upstream model.
+- `routing.model_overrides` maps requested models onto logical routing entries. Exact matches win first, then a literal `"*"` wildcard applies, and the resolved logical model is looked up in `routing.model_provider_priority`.
 - Sticky routing reuses the exact chosen `(provider, model, account)` path when it is still healthy.
 - If the sticky-bound path is unhealthy, routing falls through to the next compatible preferred target.
 - `accounts[].models`, when omitted, means the account can use any model from that provider's catalog.
 - `accounts[].weight` is used as a stable tiebreaker between otherwise equivalent compatible accounts.
+- Account health settings now live in top-level `health`.
 - Accounts are marked unhealthy on the first failure, back off exponentially, and only return after a recovery-probe path succeeds.
 
 ### Reasoning model

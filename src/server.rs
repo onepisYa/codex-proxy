@@ -67,7 +67,7 @@ pub fn build_router(state: AppState) -> Router {
 fn initialize_runtime_state(state: &AppState) {
     let (health, accounts) = with_config(state.config(), |cfg| {
         (
-            cfg.routing.health.clone(),
+            cfg.health.clone(),
             cfg.accounts.clone().into_iter().map(Into::into).collect(),
         )
     });
@@ -1260,9 +1260,7 @@ async fn api_config_put(
     state
         .sessions()
         .set_ttl(Duration::from_secs(next.session.response_id_ttl_seconds));
-    state
-        .accounts()
-        .configure_health(next.routing.health.clone());
+    state.accounts().configure_health(next.health.clone());
     state
         .accounts()
         .load_accounts(next.accounts.into_iter().map(Into::into).collect());

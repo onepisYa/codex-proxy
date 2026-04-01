@@ -553,6 +553,7 @@ pub struct RoutingHealthConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
     #[serde(default)]
     pub model_overrides: HashMap<String, String>,
@@ -560,8 +561,6 @@ pub struct RoutingConfig {
     pub model_provider_priority: HashMap<String, Vec<RouteTargetConfig>>,
     #[serde(default)]
     pub sticky_routing: StickyRoutingConfig,
-    #[serde(default)]
-    pub health: RoutingHealthConfig,
 }
 
 impl Default for RoutingHealthConfig {
@@ -687,6 +686,7 @@ pub struct Config {
     pub session: SessionConfig,
     pub auto_compaction: AutoCompactionConfig,
     pub routing: RoutingConfig,
+    pub health: RoutingHealthConfig,
     pub accounts: Vec<AccountConfig>,
     pub access: AccessControlConfig,
     pub reasoning: ReasoningConfig,
@@ -710,6 +710,8 @@ pub struct PersistedConfig {
     #[serde(default)]
     pub auto_compaction: AutoCompactionConfig,
     pub routing: RoutingConfig,
+    #[serde(default)]
+    pub health: RoutingHealthConfig,
     pub accounts: Vec<AccountConfig>,
     #[serde(default)]
     pub access: AccessControlConfig,
@@ -734,6 +736,7 @@ impl PersistedConfig {
             session: self.session,
             auto_compaction: self.auto_compaction,
             routing: self.routing,
+            health: self.health,
             accounts: self.accounts,
             access: self.access,
             reasoning: self.reasoning,
@@ -763,6 +766,8 @@ struct FileConfig {
     pub auto_compaction: Option<AutoCompactionConfig>,
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
+    #[serde(default)]
+    pub health: Option<RoutingHealthConfig>,
     #[serde(default)]
     pub accounts: Option<Vec<AccountConfig>>,
     #[serde(default)]
@@ -948,8 +953,8 @@ impl Config {
                 model_overrides: HashMap::new(),
                 model_provider_priority: HashMap::new(),
                 sticky_routing: StickyRoutingConfig::default(),
-                health: RoutingHealthConfig::default(),
             },
+            health: RoutingHealthConfig::default(),
             accounts,
             access: AccessControlConfig::default(),
             reasoning: ReasoningConfig::default(),
@@ -1017,6 +1022,9 @@ impl Config {
             if let Some(routing) = file_cfg.routing {
                 self.routing = routing;
             }
+            if let Some(health) = file_cfg.health {
+                self.health = health;
+            }
             if let Some(accounts) = file_cfg.accounts {
                 self.accounts = accounts;
             }
@@ -1051,6 +1059,7 @@ impl Config {
             session: self.session.clone(),
             auto_compaction: self.auto_compaction.clone(),
             routing: self.routing.clone(),
+            health: self.health.clone(),
             accounts: self.accounts.clone(),
             access: self.access.clone(),
             reasoning: self.reasoning.clone(),
@@ -1609,8 +1618,8 @@ mod tests {
                     }],
                 )]),
                 sticky_routing: StickyRoutingConfig { enabled: true },
-                health: RoutingHealthConfig::default(),
             },
+            health: RoutingHealthConfig::default(),
             accounts: vec![AccountConfig {
                 id: "tabcode-a".into(),
                 provider: "tabcode".into(),
@@ -1704,6 +1713,154 @@ mod tests {
 
         assert!(value.get("model_provider_priority").is_some());
         assert!(value.get("preferred_models").is_none());
+        assert!(value.get("health").is_none());
+    }
+
+    #[test]
+    fn persisted_config_uses_top_level_health() {
+        let cfg = base_config();
+        let value = serde_json::to_value(cfg.to_persisted()).unwrap();
+
+        assert!(value.get("health").is_some());
+        assert!(value
+            .get("routing")
+            .and_then(|routing| routing.get("health"))
+            .is_none());
+    }
+
+    #[test]
+    fn persisted_config_accepts_top_level_health() {
+        let persisted: PersistedConfig = serde_json::from_value(serde_json::json!({
+            "server": {
+                "host": "127.0.0.1",
+                "port": 8765,
+                "log_level": "INFO",
+                "debug_mode": false
+            },
+            "providers": {
+                "tabcode": {
+                    "type": "open_ai",
+                    "api_url": "https://tabcode.example/v1/responses",
+                    "endpoints": {},
+                    "models": ["gpt-4.1"]
+                }
+            },
+            "models": {
+                "served": ["claude-sonnet-4-6"],
+                "fallback_models": {}
+            },
+            "routing": {
+                "model_overrides": {},
+                "model_provider_priority": {
+                    "claude-sonnet-4-6": [
+                        { "provider": "tabcode", "model": "gpt-4.1" }
+                    ]
+                },
+                "sticky_routing": { "enabled": true }
+            },
+            "health": {
+                "auth_failure_immediate_unhealthy": false,
+                "failure_threshold": 7,
+                "cooldown_seconds": 90
+            },
+            "accounts": [
+                {
+                    "id": "tabcode-a",
+                    "provider": "tabcode",
+                    "enabled": true,
+                    "weight": 1,
+                    "models": ["gpt-4.1"],
+                    "auth": { "type": "api_key", "api_key": "sk-test" }
+                }
+            ],
+            "access": {
+                "require_key": false,
+                "keys": []
+            },
+            "reasoning": {
+                "effort_levels": {
+                    "none": { "budget": 0, "level": "LOW" }
+                },
+                "default_effort": null
+            },
+            "timeouts": {
+                "connect_seconds": 10,
+                "read_seconds": 30
+            },
+            "compaction": {
+                "temperature": 0.1,
+                "preferred_targets": []
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(persisted.health.failure_threshold, 7);
+        assert!(persisted.routing.model_provider_priority.contains_key("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn rejects_legacy_nested_routing_health() {
+        let err = serde_json::from_value::<PersistedConfig>(serde_json::json!({
+            "server": {
+                "host": "127.0.0.1",
+                "port": 8765,
+                "log_level": "INFO",
+                "debug_mode": false
+            },
+            "providers": {
+                "tabcode": {
+                    "type": "open_ai",
+                    "api_url": "https://tabcode.example/v1/responses",
+                    "endpoints": {},
+                    "models": ["gpt-4.1"]
+                }
+            },
+            "models": {
+                "served": ["claude-sonnet-4-6"],
+                "fallback_models": {}
+            },
+            "routing": {
+                "model_overrides": {},
+                "model_provider_priority": {
+                    "claude-sonnet-4-6": [
+                        { "provider": "tabcode", "model": "gpt-4.1" }
+                    ]
+                },
+                "sticky_routing": { "enabled": true },
+                "health": {
+                    "auth_failure_immediate_unhealthy": true,
+                    "failure_threshold": 3,
+                    "cooldown_seconds": 30
+                }
+            },
+            "health": {
+                "auth_failure_immediate_unhealthy": true,
+                "failure_threshold": 3,
+                "cooldown_seconds": 30
+            },
+            "accounts": [],
+            "access": {
+                "require_key": false,
+                "keys": []
+            },
+            "reasoning": {
+                "effort_levels": {
+                    "none": { "budget": 0, "level": "LOW" }
+                },
+                "default_effort": null
+            },
+            "timeouts": {
+                "connect_seconds": 10,
+                "read_seconds": 30
+            },
+            "compaction": {
+                "temperature": 0.1,
+                "preferred_targets": []
+            }
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field `health`"));
     }
 
     #[test]

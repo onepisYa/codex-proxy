@@ -23,6 +23,7 @@ pub struct UiConfig {
     pub providers: crate::config::ProvidersConfig,
     pub models: UiModelsConfig,
     pub routing: UiRoutingConfig,
+    pub health: crate::config::RoutingHealthConfig,
     pub accounts: Vec<AccountStatus>,
     pub reasoning: crate::config::ReasoningConfig,
     pub timeouts: crate::config::TimeoutsConfig,
@@ -50,7 +51,6 @@ pub struct UiRoutingConfig {
     pub model_provider_priority:
         std::collections::HashMap<String, Vec<crate::config::RouteTargetConfig>>,
     pub sticky_routing: crate::config::StickyRoutingConfig,
-    pub health: crate::config::RoutingHealthConfig,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -82,8 +82,8 @@ pub fn get_current_config(state: &AppState) -> UiConfig {
             model_overrides: cfg.routing.model_overrides.clone(),
             model_provider_priority: cfg.routing.model_provider_priority.clone(),
             sticky_routing: cfg.routing.sticky_routing.clone(),
-            health: cfg.routing.health.clone(),
         },
+        health: cfg.health.clone(),
         accounts: state.accounts().all_accounts_snapshot(),
         reasoning: cfg.reasoning.clone(),
         timeouts: cfg.timeouts.clone(),

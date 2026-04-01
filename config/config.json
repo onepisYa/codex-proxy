@@ -47,12 +47,12 @@
     },
     "sticky_routing": {
       "enabled": true
-    },
-    "health": {
-      "auth_failure_immediate_unhealthy": true,
-      "failure_threshold": 3,
-      "cooldown_seconds": 30
     }
+  },
+  "health": {
+    "auth_failure_immediate_unhealthy": true,
+    "failure_threshold": 3,
+    "cooldown_seconds": 30
   },
   "accounts": [],
   "access": {
@@ -91,6 +91,13 @@
   "timeouts": {
     "connect_seconds": 10,
     "read_seconds": 600
+  },
+  "auto_compaction": {
+    "enabled": true,
+    "max_attempts_per_request": 1,
+    "tail_items_to_keep": 8,
+    "compact_instructions": "Compact the conversation history for continued use. Preserve all tool and file context needed to continue the session.",
+    "summary_instructions": "Summarize the conversation history so far for continued use. Preserve key decisions, constraints, open tasks, file paths, and relevant technical details. Be concise but complete."
   },
   "compaction": {
     "temperature": 0.1,
