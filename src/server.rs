@@ -404,15 +404,12 @@ fn project_public_model_metadata(
 }
 
 fn public_model_from_config(cfg: &crate::config::Config, served_model: &str) -> PublicModelDto {
-    let logical_model = cfg.resolve_logical_model(served_model);
     let projected = cfg
-        .preferred_targets_for_model(served_model)
-        .and_then(|targets| targets.first())
+        .route_targets_for_model(served_model)
+        .and_then(|(_, targets)| targets.first())
         .and_then(|target| cfg.model_metadata(&target.provider, &target.model))
         .and_then(project_public_model_metadata)
         .unwrap_or_default();
-
-    let _ = logical_model;
 
     PublicModelDto {
         id: served_model.to_string(),
@@ -617,19 +614,15 @@ fn resolve_response_route(
     messages: &[ChatMessage],
     cache_key_override: Option<u64>,
 ) -> Result<crate::account_pool::ResolvedRoute, ProxyError> {
-    let logical_model = with_config(state.config(), |cfg| {
-        cfg.resolve_logical_model(requested_model)
-    });
-    let targets = with_config(state.config(), |cfg| {
-        cfg.preferred_targets_for_model(requested_model)
-            .map(|targets| targets.to_vec())
-    })
-    .ok_or_else(|| {
-        ProxyError::Validation(format!(
-            "No preferred route targets configured for logical model '{}'",
-            logical_model
-        ))
-    })?;
+    let Some((logical_model, targets)) = with_config(state.config(), |cfg| {
+        cfg.route_targets_for_model(requested_model)
+            .map(|(logical_model, targets)| (logical_model, targets.to_vec()))
+    }) else {
+        return Err(ProxyError::Validation(format!(
+            "No preferred route targets configured for requested model '{}'",
+            requested_model
+        )));
+    };
     let candidates = crate::account_pool::Router::build_candidates(
         requested_model,
         &logical_model,
