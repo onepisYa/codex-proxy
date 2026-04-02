@@ -242,6 +242,7 @@ impl Provider for OpenAiProvider {
     > {
         let mut payload =
             serde_json::to_value(raw_request).unwrap_or_else(|_| Value::Object(Default::default()));
+        strip_null_object_fields(&mut payload);
         apply_openai_route_overrides(&mut payload, &context);
         Box::pin(async move { self.forward_json(payload, headers, &context).await })
     }
@@ -357,6 +358,53 @@ fn budget_to_effort(budget: u64) -> &'static str {
         4097..=16384 => "medium",
         16385..=32768 => "high",
         _ => "xhigh",
+    }
+}
+
+fn strip_null_object_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            for v in map.values_mut() {
+                strip_null_object_fields(v);
+            }
+        }
+        Value::Array(values) => {
+            for v in values.iter_mut() {
+                strip_null_object_fields(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod strip_nulls_tests {
+    use super::*;
+    use crate::schema::openai::ResponsesInput;
+
+    #[test]
+    fn strips_null_tools_and_tool_choice_for_openai_compatible_upstreams() {
+        let req = ResponsesRequest {
+            model: "gpt-4.1".into(),
+            input: Some(ResponsesInput::Text("hi".into())),
+            instructions: None,
+            previous_response_id: None,
+            store: None,
+            metadata: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stream: None,
+            include: None,
+        };
+        let mut payload = serde_json::to_value(req).expect("request must serialize");
+        strip_null_object_fields(&mut payload);
+        let obj = payload.as_object().expect("top-level must be object");
+        assert!(!obj.contains_key("tools"));
+        assert!(!obj.contains_key("tool_choice"));
     }
 }
 
