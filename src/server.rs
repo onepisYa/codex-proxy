@@ -182,12 +182,69 @@ async fn run_recovery_probe_pass(state: &AppState) {
 }
 
 fn format_proxy_error(err: &ProxyError) -> String {
-    format!(
-        "{} ({}): {}",
-        err.error_code(),
-        err.status_code().as_u16(),
-        err
-    )
+    let mut message = match err {
+        ProxyError::Http(e) => format_reqwest_error(e),
+        _ => format!(
+            "{} ({}): {}",
+            err.error_code(),
+            err.status_code().as_u16(),
+            err
+        ),
+    };
+
+    message = message.replace('\n', "\\n").replace('\r', "\\r");
+    message.truncate(4096);
+    message
+}
+
+fn format_reqwest_error(err: &reqwest::Error) -> String {
+    use std::error::Error;
+
+    let mut details = Vec::new();
+    if err.is_timeout() {
+        details.push("timeout");
+    }
+    if err.is_connect() {
+        details.push("connect");
+    }
+    if err.is_request() {
+        details.push("request");
+    }
+    if err.is_body() {
+        details.push("body");
+    }
+    if err.is_decode() {
+        details.push("decode");
+    }
+
+    let mut message = String::new();
+    message.push_str("http_error");
+    if let Some(status) = err.status() {
+        message.push_str(&format!(" ({}): {}", status.as_u16(), err));
+    } else {
+        message.push_str(&format!(" (500): {}", err));
+    }
+
+    if let Some(url) = err.url() {
+        message.push_str(&format!(" url={url}"));
+    }
+    if !details.is_empty() {
+        message.push_str(&format!(" kind={}", details.join(",")));
+    }
+
+    let mut source = err.source();
+    let mut depth = 0usize;
+    while let Some(next) = source {
+        depth += 1;
+        if depth > 8 {
+            message.push_str(" caused_by=…");
+            break;
+        }
+        message.push_str(&format!(" caused_by={next}"));
+        source = next.source();
+    }
+
+    message
 }
 
 fn start_model_discovery_loop(state: &AppState) {
