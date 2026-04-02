@@ -93,7 +93,7 @@ Top-level sections:
       "models": ["glm-4.6"]
     },
     "openai": {
-      "responses_url": "https://api.openai.com/v1/responses",
+      "api_url": "https://api.openai.com/v1/responses",
       "models": ["gpt-4.1", "gpt-4.1-mini"]
     }
   },
@@ -102,12 +102,12 @@ Top-level sections:
   },
   "routing": {
     "model_routes": {
-      "claude-fast": [{ "type": "logical", "model": "claude-sonnet-4-6" }],
-      "*": [{ "type": "logical", "model": "claude-sonnet-4-6" }],
+      "claude-fast": ["proxy:claude-sonnet-4-6"],
+      "*": ["proxy:claude-sonnet-4-6"],
       "claude-sonnet-4-6": [
         {
           "type": "physical",
-          "provider": "open_ai",
+          "provider": "openai",
           "model": "gpt-4.1",
           "reasoning": { "effort": "medium" }
         },
@@ -121,7 +121,7 @@ Top-level sections:
       "compact-default": [
         {
           "type": "physical",
-          "provider": "open_ai",
+          "provider": "openai",
           "model": "gpt-4.1-mini",
           "reasoning": { "effort": "none" }
         }
@@ -136,7 +136,7 @@ Top-level sections:
   "accounts": [
     {
       "id": "openai-primary",
-      "provider": "open_ai",
+      "provider": "openai",
       "enabled": true,
       "weight": 1,
       "models": ["gpt-4.1", "gpt-4.1-mini"],
@@ -183,7 +183,12 @@ Top-level sections:
 ### Routing model
 
 - `routing.model_routes[logical_model]` is the canonical ordered list of route steps.
-- A route step is either `{"type":"physical", ...}` (an upstream `(provider, model)` target), or `{"type":"logical", ...}` (a reference to another `routing.model_routes` key).
+- A route step can be written as a shorthand string:
+  - Physical: `"provider:model"` (example: `"openai:gpt-4.1"`)
+  - Logical: `"proxy:logical_model"` (example: `"proxy:glm-5-turbo"`)
+- For per-step `endpoint` / `reasoning`, use the structured object form:
+  - Physical: `{"type":"physical", ...}`
+  - Logical: `{"type":"logical", ...}`
 - Routing resolves `routing.model_routes[requested_model]` first, then falls back to `routing.model_routes["*"]`.
 - Sticky routing is always enabled and reuses the exact chosen `(provider, model, account)` path when it is still healthy.
 - If the sticky-bound path is unhealthy, routing falls through to the next compatible preferred target.

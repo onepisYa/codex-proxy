@@ -1,6 +1,9 @@
 use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
+use serde::de::Error as _;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
+use serde::{Deserializer, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -595,9 +598,22 @@ pub struct RouteTargetConfig {
     pub reasoning: Option<RouteReasoningConfig>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelRouteStepConfig {
+    Physical {
+        provider: String,
+        model: String,
+        endpoint: Option<String>,
+        reasoning: Option<RouteReasoningConfig>,
+    },
+    Logical {
+        model: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ModelRouteStepConfig {
+enum ModelRouteStepConfigStructured {
     Physical {
         provider: String,
         model: String,
@@ -609,6 +625,117 @@ pub enum ModelRouteStepConfig {
     Logical {
         model: String,
     },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ModelRouteStepConfigWire {
+    Shorthand(String),
+    Structured(ModelRouteStepConfigStructured),
+}
+
+impl ModelRouteStepConfig {
+    fn from_shorthand(input: &str) -> Result<Self, String> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Err("route step shorthand must not be empty".into());
+        }
+        let mut parts = input.splitn(2, ':');
+        let prefix = parts.next().unwrap_or_default().trim();
+        let rest = parts.next().unwrap_or_default().trim();
+        if prefix.is_empty() || rest.is_empty() {
+            return Err(format!(
+                "invalid route step shorthand '{input}': expected 'provider:model' or 'proxy:logical_model'"
+            ));
+        }
+        if prefix == "proxy" {
+            return Ok(Self::Logical {
+                model: rest.to_string(),
+            });
+        }
+        if prefix == "open_router" {
+            return Err("provider name 'open_router' is not supported; use 'openrouter'".into());
+        }
+        Ok(Self::Physical {
+            provider: prefix.to_string(),
+            model: rest.to_string(),
+            endpoint: None,
+            reasoning: None,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelRouteStepConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ModelRouteStepConfigWire::deserialize(deserializer)?;
+        match wire {
+            ModelRouteStepConfigWire::Shorthand(value) => Self::from_shorthand(&value)
+                .map_err(|msg| D::Error::custom(format!("invalid model route step: {msg}"))),
+            ModelRouteStepConfigWire::Structured(value) => Ok(match value {
+                ModelRouteStepConfigStructured::Physical {
+                    provider,
+                    model,
+                    endpoint,
+                    reasoning,
+                } => Self::Physical {
+                    provider,
+                    model,
+                    endpoint,
+                    reasoning,
+                },
+                ModelRouteStepConfigStructured::Logical { model } => Self::Logical { model },
+            }),
+        }
+    }
+}
+
+impl Serialize for ModelRouteStepConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            ModelRouteStepConfig::Logical { model } => {
+                serializer.serialize_str(&format!("proxy:{}", model.trim()))
+            }
+            ModelRouteStepConfig::Physical {
+                provider,
+                model,
+                endpoint,
+                reasoning,
+            } => {
+                if endpoint.is_none() && reasoning.is_none() {
+                    return serializer.serialize_str(&format!(
+                        "{}:{}",
+                        provider.trim(),
+                        model.trim()
+                    ));
+                }
+
+                let mut len = 3;
+                if endpoint.is_some() {
+                    len += 1;
+                }
+                if reasoning.is_some() {
+                    len += 1;
+                }
+                let mut map = serializer.serialize_map(Some(len))?;
+                map.serialize_entry("type", "physical")?;
+                map.serialize_entry("provider", provider)?;
+                map.serialize_entry("model", model)?;
+                if let Some(endpoint) = endpoint {
+                    map.serialize_entry("endpoint", endpoint)?;
+                }
+                if let Some(reasoning) = reasoning {
+                    map.serialize_entry("reasoning", reasoning)?;
+                }
+                map.end()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1806,6 +1933,11 @@ impl Config {
                 "{scope} contains an empty provider name"
             )));
         }
+        if target.provider.trim() == "proxy" {
+            return Err(ConfigError::InvalidValue(format!(
+                "{scope} contains reserved provider name 'proxy'; use a logical step ('proxy:<logical_model>') instead"
+            )));
+        }
         if target.model.trim().is_empty() {
             return Err(ConfigError::InvalidValue(format!(
                 "{scope} contains an empty target model"
@@ -2046,6 +2178,68 @@ mod tests {
     }
 
     #[test]
+    fn parses_route_step_shorthand_physical_and_logical() {
+        let physical: ModelRouteStepConfig =
+            serde_json::from_value(serde_json::json!("tabcode:gpt-4.1")).unwrap();
+        assert_eq!(
+            physical,
+            ModelRouteStepConfig::Physical {
+                provider: "tabcode".into(),
+                model: "gpt-4.1".into(),
+                endpoint: None,
+                reasoning: None,
+            }
+        );
+
+        let logical: ModelRouteStepConfig =
+            serde_json::from_value(serde_json::json!("proxy:glm-5-turbo")).unwrap();
+        assert_eq!(
+            logical,
+            ModelRouteStepConfig::Logical {
+                model: "glm-5-turbo".into()
+            }
+        );
+    }
+
+    #[test]
+    fn serializes_route_step_shorthand_when_simple() {
+        let physical = ModelRouteStepConfig::Physical {
+            provider: "tabcode".into(),
+            model: "gpt-4.1".into(),
+            endpoint: None,
+            reasoning: None,
+        };
+        assert_eq!(
+            serde_json::to_value(physical).unwrap(),
+            serde_json::json!("tabcode:gpt-4.1")
+        );
+
+        let logical = ModelRouteStepConfig::Logical {
+            model: "glm-5-turbo".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(logical).unwrap(),
+            serde_json::json!("proxy:glm-5-turbo")
+        );
+
+        let structured = ModelRouteStepConfig::Physical {
+            provider: "tabcode".into(),
+            model: "gpt-4.1".into(),
+            endpoint: None,
+            reasoning: Some(RouteReasoningConfig {
+                effort: Some("medium".into()),
+                budget: None,
+                level: None,
+            }),
+        };
+        let value = serde_json::to_value(structured).unwrap();
+        assert_eq!(value["type"], "physical");
+        assert_eq!(value["provider"], "tabcode");
+        assert_eq!(value["model"], "gpt-4.1");
+        assert_eq!(value["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
     fn persisted_config_uses_top_level_health() {
         let cfg = base_config();
         let value = serde_json::to_value(cfg.to_persisted()).unwrap();
@@ -2081,7 +2275,7 @@ mod tests {
             "routing": {
                 "model_routes": {
                     "claude-sonnet-4-6": [
-                        { "type": "physical", "provider": "tabcode", "model": "gpt-4.1" }
+                        "tabcode:gpt-4.1"
                     ]
                 },
             },
@@ -2152,7 +2346,7 @@ mod tests {
             "routing": {
                 "model_routes": {
                     "claude-sonnet-4-6": [
-                        { "type": "physical", "provider": "tabcode", "model": "gpt-4.1" }
+                        "tabcode:gpt-4.1"
                     ]
                 },
                 "health": {
@@ -2213,7 +2407,7 @@ mod tests {
             "routing": {
                 "model_routes": {
                     "claude-sonnet-4-6": [
-                        { "type": "physical", "provider": "tabcode", "model": "gpt-4.1" }
+                        "tabcode:gpt-4.1"
                     ]
                 },
                 "sticky_routing": {

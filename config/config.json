@@ -39,11 +39,7 @@
   "routing": {
     "model_routes": {
       "*": [
-        {
-          "type": "physical",
-          "provider": "openai",
-          "model": "gpt-5"
-        }
+        "openai:gpt-5"
       ]
     }
   },
