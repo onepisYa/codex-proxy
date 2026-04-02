@@ -1,9 +1,6 @@
 use parking_lot::RwLock;
 use serde::de::DeserializeOwned;
-use serde::de::Error as _;
-use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
-use serde::{Deserializer, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -598,12 +595,15 @@ pub struct RouteTargetConfig {
     pub reasoning: Option<RouteReasoningConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelRouteStepConfig {
     Physical {
         provider: String,
         model: String,
+        #[serde(default)]
         endpoint: Option<String>,
+        #[serde(default)]
         reasoning: Option<RouteReasoningConfig>,
     },
     Logical {
@@ -612,129 +612,49 @@ pub enum ModelRouteStepConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ModelRouteStepConfigStructured {
-    Physical {
-        provider: String,
-        model: String,
-        #[serde(default)]
-        endpoint: Option<String>,
-        #[serde(default)]
-        reasoning: Option<RouteReasoningConfig>,
-    },
-    Logical {
-        model: String,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-enum ModelRouteStepConfigWire {
+pub enum ModelRouteStepWire {
     Shorthand(String),
-    Structured(ModelRouteStepConfigStructured),
+    Structured(ModelRouteStepConfig),
 }
 
-impl ModelRouteStepConfig {
-    fn from_shorthand(input: &str) -> Result<Self, String> {
+impl ModelRouteStepWire {
+    fn into_step(self) -> Result<ModelRouteStepConfig, ConfigError> {
+        let input = match self {
+            ModelRouteStepWire::Structured(step) => return Ok(step),
+            ModelRouteStepWire::Shorthand(input) => input,
+        };
+
         let input = input.trim();
         if input.is_empty() {
-            return Err("route step shorthand must not be empty".into());
+            return Err(ConfigError::InvalidValue(
+                "route step shorthand must not be empty".into(),
+            ));
         }
         let mut parts = input.splitn(2, ':');
         let prefix = parts.next().unwrap_or_default().trim();
         let rest = parts.next().unwrap_or_default().trim();
         if prefix.is_empty() || rest.is_empty() {
-            return Err(format!(
+            return Err(ConfigError::InvalidValue(format!(
                 "invalid route step shorthand '{input}': expected 'provider:model' or 'proxy:logical_model'"
-            ));
+            )));
         }
         if prefix == "proxy" {
-            return Ok(Self::Logical {
+            return Ok(ModelRouteStepConfig::Logical {
                 model: rest.to_string(),
             });
         }
         if prefix == "open_router" {
-            return Err("provider name 'open_router' is not supported; use 'openrouter'".into());
+            return Err(ConfigError::InvalidValue(
+                "provider name 'open_router' is not supported; use 'openrouter'".into(),
+            ));
         }
-        Ok(Self::Physical {
+        Ok(ModelRouteStepConfig::Physical {
             provider: prefix.to_string(),
             model: rest.to_string(),
             endpoint: None,
             reasoning: None,
         })
-    }
-}
-
-impl<'de> Deserialize<'de> for ModelRouteStepConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = ModelRouteStepConfigWire::deserialize(deserializer)?;
-        match wire {
-            ModelRouteStepConfigWire::Shorthand(value) => Self::from_shorthand(&value)
-                .map_err(|msg| D::Error::custom(format!("invalid model route step: {msg}"))),
-            ModelRouteStepConfigWire::Structured(value) => Ok(match value {
-                ModelRouteStepConfigStructured::Physical {
-                    provider,
-                    model,
-                    endpoint,
-                    reasoning,
-                } => Self::Physical {
-                    provider,
-                    model,
-                    endpoint,
-                    reasoning,
-                },
-                ModelRouteStepConfigStructured::Logical { model } => Self::Logical { model },
-            }),
-        }
-    }
-}
-
-impl Serialize for ModelRouteStepConfig {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            ModelRouteStepConfig::Logical { model } => {
-                serializer.serialize_str(&format!("proxy:{}", model.trim()))
-            }
-            ModelRouteStepConfig::Physical {
-                provider,
-                model,
-                endpoint,
-                reasoning,
-            } => {
-                if endpoint.is_none() && reasoning.is_none() {
-                    return serializer.serialize_str(&format!(
-                        "{}:{}",
-                        provider.trim(),
-                        model.trim()
-                    ));
-                }
-
-                let mut len = 3;
-                if endpoint.is_some() {
-                    len += 1;
-                }
-                if reasoning.is_some() {
-                    len += 1;
-                }
-                let mut map = serializer.serialize_map(Some(len))?;
-                map.serialize_entry("type", "physical")?;
-                map.serialize_entry("provider", provider)?;
-                map.serialize_entry("model", model)?;
-                if let Some(endpoint) = endpoint {
-                    map.serialize_entry("endpoint", endpoint)?;
-                }
-                if let Some(reasoning) = reasoning {
-                    map.serialize_entry("reasoning", reasoning)?;
-                }
-                map.end()
-            }
-        }
     }
 }
 
@@ -753,6 +673,48 @@ pub struct RoutingHealthConfig {
 pub struct RoutingConfig {
     #[serde(default)]
     pub model_routes: HashMap<String, Vec<ModelRouteStepConfig>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingConfigWire {
+    #[serde(default)]
+    pub model_routes: HashMap<String, Vec<ModelRouteStepWire>>,
+}
+
+impl RoutingConfigWire {
+    pub fn into_runtime(self) -> Result<RoutingConfig, ConfigError> {
+        let mut model_routes = HashMap::with_capacity(self.model_routes.len());
+        for (route_key, steps) in self.model_routes {
+            let mut out_steps = Vec::with_capacity(steps.len());
+            for (idx, step) in steps.into_iter().enumerate() {
+                let scope = format!("routing.model_routes['{}'][{}]", route_key, idx);
+                let parsed = step
+                    .into_step()
+                    .map_err(|e| ConfigError::InvalidValue(format!("{scope}: {e}")))?;
+                out_steps.push(parsed);
+            }
+            model_routes.insert(route_key, out_steps);
+        }
+        Ok(RoutingConfig { model_routes })
+    }
+}
+
+impl RoutingConfig {
+    pub fn to_wire(&self) -> RoutingConfigWire {
+        let mut model_routes = HashMap::with_capacity(self.model_routes.len());
+        for (route_key, steps) in &self.model_routes {
+            model_routes.insert(
+                route_key.clone(),
+                steps
+                    .iter()
+                    .cloned()
+                    .map(ModelRouteStepWire::Structured)
+                    .collect(),
+            );
+        }
+        RoutingConfigWire { model_routes }
+    }
 }
 
 impl Default for RoutingHealthConfig {
@@ -902,7 +864,7 @@ pub struct PersistedConfig {
     pub session: SessionConfig,
     #[serde(default)]
     pub auto_compaction: AutoCompactionConfig,
-    pub routing: RoutingConfig,
+    pub routing: RoutingConfigWire,
     #[serde(default)]
     pub health: RoutingHealthConfig,
     pub accounts: Vec<AccountConfig>,
@@ -928,7 +890,10 @@ impl PersistedConfig {
             models_endpoint: self.models_endpoint,
             session: self.session,
             auto_compaction: self.auto_compaction,
-            routing: self.routing,
+            routing: self
+                .routing
+                .into_runtime()
+                .expect("invalid routing configuration"),
             health: self.health,
             accounts: self.accounts,
             access: self.access,
@@ -958,7 +923,7 @@ struct FileConfig {
     #[serde(default)]
     pub auto_compaction: Option<AutoCompactionConfig>,
     #[serde(default)]
-    pub routing: Option<RoutingConfig>,
+    pub routing: Option<RoutingConfigWire>,
     #[serde(default)]
     pub health: Option<RoutingHealthConfig>,
     #[serde(default)]
@@ -1209,7 +1174,9 @@ impl Config {
             self.auto_compaction = auto_compaction;
         }
         if let Some(routing) = file_cfg.routing {
-            self.routing = routing;
+            self.routing = routing
+                .into_runtime()
+                .unwrap_or_else(|e| panic!("Invalid routing config in {}: {e}", path.display()));
         }
         if let Some(health) = file_cfg.health {
             self.health = health;
@@ -1276,7 +1243,9 @@ impl Config {
                 self.auto_compaction = auto_compaction;
             }
             if let Some(routing) = file_cfg.routing {
-                self.routing = routing;
+                self.routing = routing.into_runtime().unwrap_or_else(|e| {
+                    panic!("Invalid routing config in {}: {e}", path.display())
+                });
             }
             if let Some(health) = file_cfg.health {
                 self.health = health;
@@ -1314,7 +1283,7 @@ impl Config {
             models_endpoint: self.models_endpoint.clone(),
             session: self.session.clone(),
             auto_compaction: self.auto_compaction.clone(),
-            routing: self.routing.clone(),
+            routing: self.routing.to_wire(),
             health: self.health.clone(),
             accounts: self.accounts.clone(),
             access: self.access.clone(),
@@ -2179,10 +2148,10 @@ mod tests {
 
     #[test]
     fn parses_route_step_shorthand_physical_and_logical() {
-        let physical: ModelRouteStepConfig =
+        let physical: ModelRouteStepWire =
             serde_json::from_value(serde_json::json!("tabcode:gpt-4.1")).unwrap();
         assert_eq!(
-            physical,
+            physical.into_step().unwrap(),
             ModelRouteStepConfig::Physical {
                 provider: "tabcode".into(),
                 model: "gpt-4.1".into(),
@@ -2191,10 +2160,10 @@ mod tests {
             }
         );
 
-        let logical: ModelRouteStepConfig =
+        let logical: ModelRouteStepWire =
             serde_json::from_value(serde_json::json!("proxy:glm-5-turbo")).unwrap();
         assert_eq!(
-            logical,
+            logical.into_step().unwrap(),
             ModelRouteStepConfig::Logical {
                 model: "glm-5-turbo".into()
             }
@@ -2202,27 +2171,14 @@ mod tests {
     }
 
     #[test]
-    fn serializes_route_step_shorthand_when_simple() {
-        let physical = ModelRouteStepConfig::Physical {
-            provider: "tabcode".into(),
-            model: "gpt-4.1".into(),
-            endpoint: None,
-            reasoning: None,
-        };
+    fn wire_serializes_shorthand_and_structured_steps() {
+        let shorthand = ModelRouteStepWire::Shorthand("tabcode:gpt-4.1".into());
         assert_eq!(
-            serde_json::to_value(physical).unwrap(),
+            serde_json::to_value(shorthand).unwrap(),
             serde_json::json!("tabcode:gpt-4.1")
         );
 
-        let logical = ModelRouteStepConfig::Logical {
-            model: "glm-5-turbo".into(),
-        };
-        assert_eq!(
-            serde_json::to_value(logical).unwrap(),
-            serde_json::json!("proxy:glm-5-turbo")
-        );
-
-        let structured = ModelRouteStepConfig::Physical {
+        let structured = ModelRouteStepWire::Structured(ModelRouteStepConfig::Physical {
             provider: "tabcode".into(),
             model: "gpt-4.1".into(),
             endpoint: None,
@@ -2231,7 +2187,7 @@ mod tests {
                 budget: None,
                 level: None,
             }),
-        };
+        });
         let value = serde_json::to_value(structured).unwrap();
         assert_eq!(value["type"], "physical");
         assert_eq!(value["provider"], "tabcode");
