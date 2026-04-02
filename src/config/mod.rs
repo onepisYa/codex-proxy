@@ -1461,6 +1461,18 @@ impl Config {
                     requested_model, mapped_model
                 )));
             }
+            if requested_model != "*"
+                && self
+                    .routing
+                    .model_provider_priority
+                    .contains_key(requested_model)
+                && mapped_model != requested_model
+            {
+                return Err(ConfigError::InvalidValue(format!(
+                    "routing.model_overrides['{}'] conflicts with routing.model_provider_priority['{}'] (model maps to '{}' but also has direct routing targets)",
+                    requested_model, requested_model, mapped_model
+                )));
+            }
         }
 
         for (requested_model, fallback_model) in &self.models.fallback_models {
@@ -1480,6 +1492,26 @@ impl Config {
                     requested_model, fallback_model
                 )));
             }
+            if requested_model != "*"
+                && self
+                    .routing
+                    .model_provider_priority
+                    .contains_key(requested_model)
+            {
+                return Err(ConfigError::InvalidValue(format!(
+                    "models.fallback_models['{}'] conflicts with routing.model_provider_priority['{}'] (model has direct routing targets so fallback never applies)",
+                    requested_model, requested_model
+                )));
+            }
+        }
+
+        if let Some(override_wildcard) = self.routing.model_overrides.get("*")
+            && self.models.fallback_models.contains_key("*")
+        {
+            return Err(ConfigError::InvalidValue(format!(
+                "routing.model_overrides['*']='{}' conflicts with models.fallback_models['*'] (choose exactly one wildcard fallback mechanism)",
+                override_wildcard
+            )));
         }
 
         if !self.models.served.is_empty() {
@@ -2325,6 +2357,80 @@ mod tests {
         assert_eq!(logical_model, "claude-sonnet-4-6");
         assert_eq!(targets[0].provider, "tabcode");
         assert_eq!(targets[0].model, "gpt-4.1");
+    }
+
+    #[test]
+    fn model_overrides_conflicts_with_direct_physical_entry() {
+        let mut cfg = base_config();
+        cfg.routing.model_provider_priority.insert(
+            "gpt-4.1-mini".into(),
+            vec![RouteTargetConfig {
+                provider: "openai".into(),
+                model: "gpt-4.1-mini".into(),
+                endpoint: None,
+                reasoning: None,
+            }],
+        );
+        cfg.accounts.push(AccountConfig {
+            id: "openai-a".into(),
+            provider: "openai".into(),
+            enabled: true,
+            weight: 1,
+            models: Some(vec!["gpt-4.1-mini".into()]),
+            auth: AccountAuth::ApiKey {
+                api_key: "sk-test".into(),
+            },
+        });
+        cfg.routing
+            .model_overrides
+            .insert("gpt-4.1-mini".into(), "claude-sonnet-4-6".into());
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("routing.model_overrides['gpt-4.1-mini'] conflicts with routing.model_provider_priority['gpt-4.1-mini']"));
+    }
+
+    #[test]
+    fn fallback_models_conflicts_with_direct_physical_entry() {
+        let mut cfg = base_config();
+        cfg.routing.model_provider_priority.insert(
+            "gpt-4.1-mini".into(),
+            vec![RouteTargetConfig {
+                provider: "openai".into(),
+                model: "gpt-4.1-mini".into(),
+                endpoint: None,
+                reasoning: None,
+            }],
+        );
+        cfg.accounts.push(AccountConfig {
+            id: "openai-a".into(),
+            provider: "openai".into(),
+            enabled: true,
+            weight: 1,
+            models: Some(vec!["gpt-4.1-mini".into()]),
+            auth: AccountAuth::ApiKey {
+                api_key: "sk-test".into(),
+            },
+        });
+        cfg.models
+            .fallback_models
+            .insert("gpt-4.1-mini".into(), "claude-sonnet-4-6".into());
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("models.fallback_models['gpt-4.1-mini'] conflicts with routing.model_provider_priority['gpt-4.1-mini']"));
+    }
+
+    #[test]
+    fn wildcard_override_and_wildcard_fallback_models_conflict() {
+        let mut cfg = base_config();
+        cfg.routing
+            .model_overrides
+            .insert("*".into(), "claude-sonnet-4-6".into());
+        cfg.models
+            .fallback_models
+            .insert("*".into(), "claude-sonnet-4-6".into());
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("routing.model_overrides['*']='claude-sonnet-4-6' conflicts with models.fallback_models['*']"));
     }
 
     #[test]
