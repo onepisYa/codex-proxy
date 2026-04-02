@@ -94,7 +94,7 @@ impl ZAIProvider {
         }
 
         if req.stream {
-            self.handle_stream_response(resp, req).await
+            self.handle_stream_response(resp, req, context).await
         } else {
             self.handle_sync_response(resp).await
         }
@@ -104,14 +104,17 @@ impl ZAIProvider {
         &self,
         resp: reqwest::Response,
         req: &ChatRequest,
+        context: &ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
         let model = req.model.clone();
         let created_ts = now_seconds();
+        let idle_timeout_seconds = with_config(&context.config, |cfg| cfg.timeouts.read_seconds);
         let sse_stream = crate::providers::zai_stream::stream_responses_sse(
             resp.bytes_stream(),
             &model,
             created_ts,
             req,
+            idle_timeout_seconds,
         );
         let body = Body::from_stream(sse_stream);
         Ok(Response::builder()

@@ -5,12 +5,13 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 use crate::schema::json_value::JsonValue;
 use crate::schema::openai::ChatRequest;
 use crate::schema::sse::{
+    FailedResponseObject, ResponseError, ResponseFailedData,
     FunctionCallItem, LocalShellCallItem, MessageItem, OutputContentPart, OutputItem,
     ResponseCompletedData, ResponseCreatedData, ResponseEvent, ResponseObject,
     ResponseOutputItemAddedData, ResponseOutputItemDoneData, ResponseOutputTextDeltaData, Usage,
@@ -21,10 +22,12 @@ pub fn stream_responses_sse(
     model: &str,
     created_ts: i64,
     request: &ChatRequest,
+    idle_timeout_seconds: u64,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     let model = model.to_string();
     let resp_id = format!("resp_{created_ts}");
     let req = request.clone();
+    let idle_timeout_seconds = idle_timeout_seconds.max(1);
 
     Box::pin(async_stream::stream! {
         let mut seq_num: u64 = 0;
@@ -45,12 +48,40 @@ pub fn stream_responses_sse(
         let mut byte_stream = std::pin::pin!(byte_stream);
         let mut line_buf = String::new();
         let mut saw_done = false;
-        while let Some(chunk_result) = byte_stream.next().await {
+        loop {
+            let next_chunk = match tokio::time::timeout(
+                Duration::from_secs(idle_timeout_seconds),
+                byte_stream.next(),
+            ).await {
+                Ok(v) => v,
+                Err(_) => {
+                    let msg = format!("Upstream stream idle for {idle_timeout_seconds}s");
+                    yield Ok(encode_event(
+                        &mut seq_num,
+                        "response.failed",
+                        ResponseFailedData {
+                            response: response_failed(&resp_id, &model, created_ts, &req, "stream_timeout", &msg),
+                        },
+                    ));
+                    return;
+                }
+            };
+
+            let Some(chunk_result) = next_chunk else { break };
+
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => {
-                    debug!("ZAI stream error: {}", e);
-                    break;
+                    let msg = format!("Upstream stream error: {e}");
+                    debug!("{msg}");
+                    yield Ok(encode_event(
+                        &mut seq_num,
+                        "response.failed",
+                        ResponseFailedData {
+                            response: response_failed(&resp_id, &model, created_ts, &req, "stream_error", &msg),
+                        },
+                    ));
+                    return;
                 }
             };
             let text = String::from_utf8_lossy(&chunk);
@@ -359,6 +390,28 @@ fn response_in_progress(
         metadata: req.metadata.clone(),
         output: Vec::new(),
         usage: None,
+    }
+}
+
+fn response_failed(
+    resp_id: &str,
+    model: &str,
+    created_ts: i64,
+    req: &ChatRequest,
+    code: &str,
+    message: &str,
+) -> FailedResponseObject {
+    FailedResponseObject {
+        id: resp_id.to_string(),
+        object: "response",
+        created_at: created_ts,
+        status: "failed",
+        model: model.to_string(),
+        error: ResponseError {
+            code: code.to_string(),
+            message: message.to_string(),
+        },
+        metadata: req.metadata.clone(),
     }
 }
 

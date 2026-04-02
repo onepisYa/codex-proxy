@@ -161,6 +161,7 @@ impl GeminiProvider {
         let created_ts = now_seconds();
         let resp_id = format!("resp_{created_ts}");
         let model_owned = model.to_string();
+        let idle_timeout_seconds = with_config(&context.config, |cfg| cfg.timeouts.read_seconds);
 
         let byte_stream = resp.bytes_stream();
         let sse_stream = crate::providers::gemini_stream::stream_responses_sse(
@@ -169,6 +170,7 @@ impl GeminiProvider {
             &model_owned,
             created_ts,
             req_data,
+            idle_timeout_seconds,
         );
         let body = Body::from_stream(sse_stream);
         Ok(Response::builder()

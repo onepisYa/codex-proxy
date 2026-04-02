@@ -26,6 +26,28 @@ pub struct ResponseCompletedData {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct ResponseFailedData {
+    pub response: FailedResponseObject,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FailedResponseObject {
+    pub id: String,
+    pub object: &'static str,
+    pub created_at: i64,
+    pub status: &'static str,
+    pub model: String,
+    pub error: ResponseError,
+    pub metadata: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ResponseError {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ResponseOutputItemAddedData {
     pub response_id: String,
     pub output_index: usize,
@@ -194,4 +216,42 @@ pub enum ReasoningContentPart {
 pub enum SummaryPart {
     #[serde(rename = "summary_text")]
     SummaryText { text: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_failed_event_serializes_error_shape() {
+        let evt = ResponseEvent {
+            id: "evt_test".to_string(),
+            object: "response.event",
+            event_type: "response.failed",
+            created_at: 123,
+            sequence_number: 41,
+            data: ResponseFailedData {
+                response: FailedResponseObject {
+                    id: "resp_test".to_string(),
+                    object: "response",
+                    created_at: 123,
+                    status: "failed",
+                    model: "glm-5-turbo".to_string(),
+                    error: ResponseError {
+                        code: "stream_timeout".to_string(),
+                        message: "Upstream stream idle".to_string(),
+                    },
+                    metadata: BTreeMap::new(),
+                },
+            },
+        };
+
+        // Assert only load-bearing keys to keep this test resilient.
+        let val = serde_json::to_value(evt).expect("event must serialize");
+        assert_eq!(val["type"], "response.failed");
+        assert_eq!(val["response"]["status"], "failed");
+        assert_eq!(val["response"]["error"]["code"], "stream_timeout");
+        assert_eq!(val["response"]["error"]["message"], "Upstream stream idle");
+        assert_eq!(val["response"]["model"], "glm-5-turbo");
+    }
 }
