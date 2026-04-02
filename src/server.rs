@@ -1054,7 +1054,7 @@ mod auto_compaction_tests {
                         api_url: "https://route-only.example/v1/responses".into(),
                         models_url: None,
                         endpoints: HashMap::new(),
-                        models: Vec::new(),
+                        models: vec!["real-routed-model".into()],
                     },
                 ),
                 (
@@ -1273,12 +1273,13 @@ mod auto_compaction_tests {
     }
 
     #[test]
-    fn recovery_probe_uses_configured_routed_model() {
+    fn recovery_probe_uses_provider_catalog_when_account_models_missing() {
         let state = base_test_state();
         let (account, _) = state.accounts().get_account(0).unwrap();
         let target = with_config(state.config(), |cfg| {
             cfg.recovery_probe_target(&account.provider).unwrap()
         });
+        assert_eq!(target.model, "real-routed-model");
 
         let route = crate::account_pool::ResolvedRoute {
             requested_model: target.model.clone(),

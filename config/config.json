@@ -21,13 +21,13 @@
       "models": []
     },
     "openai": {
-      "type": "open_ai",
+      "type": "openai",
       "endpoints": {},
       "models": [],
       "api_url": "https://api.openai.com/v1/responses"
     },
     "tabcode": {
-      "type": "open_ai",
+      "type": "openai",
       "api_url": "https://api2.tabcode.cc/openai/v1/responses",
       "endpoints": {},
       "models": []
@@ -43,7 +43,7 @@
     },
     "model_provider_priority": {
       "glm-5-turbo": []
-    },
+    }
   },
   "health": {
     "auth_failure_immediate_unhealthy": true,

@@ -563,7 +563,42 @@ pub struct TimeoutsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionConfig {
     pub temperature: f64,
+    #[serde(default, deserialize_with = "deserialize_compaction_preferred_targets")]
     pub preferred_targets: Vec<String>,
+}
+
+fn deserialize_compaction_preferred_targets<'de, D>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum PreferredTargetItem {
+        String(String),
+        Map(serde_json::Map<String, serde_json::Value>),
+    }
+
+    let raw = Vec::<PreferredTargetItem>::deserialize(deserializer)?;
+    raw.into_iter()
+        .map(|item| match item {
+            PreferredTargetItem::String(s) => Ok(s),
+            PreferredTargetItem::Map(map) => {
+                if let Some(v) = map.get("logical_model").and_then(|v| v.as_str()) {
+                    return Ok(v.to_string());
+                }
+                if let Some(v) = map.get("model").and_then(|v| v.as_str()) {
+                    return Ok(v.to_string());
+                }
+                Err(D::Error::custom(
+                    "compaction.preferred_targets entries must be a string or an object with 'logical_model' or 'model'",
+                ))
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1407,55 +1442,51 @@ impl Config {
     }
 
     pub fn recovery_probe_target(&self, provider: &str) -> Option<RouteTargetConfig> {
-        self.routing
-            .model_provider_priority
-            .values()
-            .flat_map(|targets| targets.iter())
-            .find(|target| target.provider == provider)
-            .cloned()
-            .or_else(|| {
-                self.accounts
+        // Health probes should not depend on routing: routing targets might omit providers
+        // that are only used as fallbacks, and probes should still work for those accounts.
+        let has_enabled_account = self
+            .accounts
+            .iter()
+            .any(|account| account.enabled && account.provider == provider);
+        if !has_enabled_account {
+            return None;
+        }
+
+        let catalog = self.provider_catalog(provider);
+        let resolve_model = |model: &str| -> Option<String> {
+            let model = model.trim();
+            if model.is_empty() {
+                return None;
+            }
+            match &catalog {
+                Some(catalog) => catalog
                     .iter()
-                    .find(|account| account.enabled && account.provider == provider)
-                    .and_then(|account| {
-                        account.models.as_ref().and_then(|models| {
-                            models.iter().find_map(|model| {
-                                self.provider_catalog(provider)
-                                    .map_or(Some(model.clone()), |catalog| {
-                                        catalog.contains(model).then(|| model.clone())
-                                    })
-                            })
-                        })
-                    })
-                    .map(|model| RouteTargetConfig {
-                        provider: provider.to_string(),
-                        model,
-                        endpoint: None,
-                        reasoning: None,
-                    })
-            })
+                    .any(|m| m == model)
+                    .then(|| model.to_string()),
+                None => Some(model.to_string()),
+            }
+        };
+
+        let model = self
+            .accounts
+            .iter()
+            .filter(|account| account.enabled && account.provider == provider)
+            .filter_map(|account| account.models.as_ref())
+            .flat_map(|models| models.iter())
+            .find_map(|model| resolve_model(model))
             .or_else(|| {
-                self.provider_catalog(provider).and_then(|catalog| {
-                    catalog.iter().find_map(|model| {
-                        self.accounts
-                            .iter()
-                            .any(|account| {
-                                account.enabled
-                                    && account.provider == provider
-                                    && account
-                                        .models
-                                        .as_ref()
-                                        .is_some_and(|models| models.contains(model))
-                            })
-                            .then(|| RouteTargetConfig {
-                                provider: provider.to_string(),
-                                model: model.clone(),
-                                endpoint: None,
-                                reasoning: None,
-                            })
-                    })
-                })
-            })
+                catalog
+                    .as_ref()
+                    .and_then(|catalog| catalog.first())
+                    .cloned()
+            })?;
+
+        Some(RouteTargetConfig {
+            provider: provider.to_string(),
+            model,
+            endpoint: None,
+            reasoning: None,
+        })
     }
 
     pub fn is_served_model_allowed(&self, model: &str) -> bool {
@@ -2099,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_probe_target_prefers_routing_target() {
+    fn recovery_probe_target_ignores_routing_target() {
         let mut cfg = base_config();
         cfg.providers.insert(
             "route-only".into(),
@@ -2107,7 +2138,7 @@ mod tests {
                 api_url: "https://route-only.example/v1/responses".into(),
                 models_url: None,
                 endpoints: HashMap::new(),
-                models: Vec::new(),
+                models: vec!["account-model".into(), "catalog-model".into()],
             },
         );
         cfg.routing.model_provider_priority.insert(
@@ -2124,7 +2155,7 @@ mod tests {
             provider: "route-only".into(),
             enabled: true,
             weight: 1,
-            models: None,
+            models: Some(vec!["account-model".into()]),
             auth: AccountAuth::ApiKey {
                 api_key: "sk-test".into(),
             },
@@ -2132,7 +2163,7 @@ mod tests {
 
         let target = cfg.recovery_probe_target("route-only").unwrap();
         assert_eq!(target.provider, "route-only");
-        assert_eq!(target.model, "routed-model");
+        assert_eq!(target.model, "account-model");
     }
 
     #[test]
@@ -2163,7 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_probe_target_has_no_fake_probe_fallback() {
+    fn recovery_probe_target_uses_provider_catalog_when_account_models_missing() {
         let mut cfg = base_config();
         cfg.providers.insert(
             "no-probe".into(),
@@ -2185,7 +2216,26 @@ mod tests {
             },
         });
 
-        assert!(cfg.recovery_probe_target("no-probe").is_none());
+        let target = cfg.recovery_probe_target("no-probe").unwrap();
+        assert_eq!(target.model, "catalog-model");
         assert!(cfg.recovery_probe_target("missing-provider").is_none());
+    }
+
+    #[test]
+    fn preferred_targets_accept_string_or_object() {
+        let compaction: CompactionConfig = serde_json::from_value(serde_json::json!({
+            "temperature": 0.1,
+            "preferred_targets": [
+              "glm-5-turbo",
+              { "model": "claude-sonnet-4-6" },
+              { "logical_model": "gpt-5" }
+            ]
+        }))
+        .expect("compaction config must parse");
+
+        assert_eq!(
+            compaction.preferred_targets,
+            vec!["glm-5-turbo", "claude-sonnet-4-6", "gpt-5"]
+        );
     }
 }
