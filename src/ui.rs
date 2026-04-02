@@ -41,14 +41,11 @@ pub struct UiServerConfig {
 #[derive(Clone, Debug, Serialize)]
 pub struct UiModelsConfig {
     pub served: Vec<String>,
-    pub fallback_models: std::collections::HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct UiRoutingConfig {
-    pub model_overrides: std::collections::HashMap<String, String>,
-    pub model_provider_priority:
-        std::collections::HashMap<String, Vec<crate::config::RouteTargetConfig>>,
+    pub model_routes: std::collections::HashMap<String, Vec<crate::config::ModelRouteStepConfig>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -73,11 +70,9 @@ pub fn get_current_config(state: &AppState) -> UiConfig {
         providers: cfg.providers.clone(),
         models: UiModelsConfig {
             served: cfg.models.served.clone(),
-            fallback_models: cfg.models.fallback_models.clone(),
         },
         routing: UiRoutingConfig {
-            model_overrides: cfg.routing.model_overrides.clone(),
-            model_provider_priority: cfg.routing.model_provider_priority.clone(),
+            model_routes: cfg.routing.model_routes.clone(),
         },
         health: cfg.health.clone(),
         accounts: state.accounts().all_accounts_snapshot(),

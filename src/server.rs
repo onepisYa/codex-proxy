@@ -404,9 +404,12 @@ fn project_public_model_metadata(
 }
 
 fn public_model_from_config(cfg: &crate::config::Config, served_model: &str) -> PublicModelDto {
-    let projected = cfg
+    let targets = cfg
         .route_targets_for_model(served_model)
-        .and_then(|(_, targets)| targets.first())
+        .map(|(_, targets)| targets);
+    let projected = targets
+        .as_ref()
+        .and_then(|targets| targets.first())
         .and_then(|target| cfg.model_metadata(&target.provider, &target.model))
         .and_then(project_public_model_metadata)
         .unwrap_or_default();
@@ -616,7 +619,6 @@ fn resolve_response_route(
 ) -> Result<crate::account_pool::ResolvedRoute, ProxyError> {
     let Some((logical_model, targets)) = with_config(state.config(), |cfg| {
         cfg.route_targets_for_model(requested_model)
-            .map(|(logical_model, targets)| (logical_model, targets.to_vec()))
     }) else {
         return Err(ProxyError::Validation(format!(
             "No preferred route targets configured for requested model '{}'",
@@ -1142,7 +1144,6 @@ mod auto_compaction_tests {
                     "logical-route-only".into(),
                     "served-without-metadata".into(),
                 ],
-                fallback_models: HashMap::new(),
             },
             model_discovery: ModelDiscoveryConfig {
                 enabled: false,
@@ -1166,11 +1167,10 @@ mod auto_compaction_tests {
             session: SessionConfig::default(),
             auto_compaction: AutoCompactionConfig::default(),
             routing: RoutingConfig {
-                model_overrides: HashMap::new(),
-                model_provider_priority: HashMap::from([
+                model_routes: HashMap::from([
                     (
                         "logical-route-only".into(),
-                        vec![crate::config::RouteTargetConfig {
+                        vec![crate::config::ModelRouteStepConfig::Physical {
                             provider: "route-only".into(),
                             model: "real-routed-model".into(),
                             endpoint: Some("private-endpoint".into()),
@@ -1179,7 +1179,7 @@ mod auto_compaction_tests {
                     ),
                     (
                         "served-without-metadata".into(),
-                        vec![crate::config::RouteTargetConfig {
+                        vec![crate::config::ModelRouteStepConfig::Physical {
                             provider: "route-only".into(),
                             model: "unknown-upstream-model".into(),
                             endpoint: None,

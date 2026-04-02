@@ -34,15 +34,17 @@
     }
   },
   "models": {
-    "served": [],
-    "fallback_models": {}
+    "served": []
   },
   "routing": {
-    "model_overrides": {
-      "*": "glm-5-turbo"
-    },
-    "model_provider_priority": {
-      "glm-5-turbo": []
+    "model_routes": {
+      "*": [
+        {
+          "type": "physical",
+          "provider": "openai",
+          "model": "gpt-5"
+        }
+      ]
     }
   },
   "health": {

@@ -8,45 +8,26 @@ on:
 
 jobs:
   test:
-    name: Test Latest Version
+    name: Rust CI
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.14
-        uses: actions/setup-python@v5
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: '3.14'
+          components: rustfmt
 
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('config/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
 
-      - name: Install dependencies
-        run: |
-          pip install -r config/requirements.txt
+      - name: Format
+        run: cargo fmt --check
 
-      - name: Run linting
-        run: |
-          ruff check src/ tests/
+      - name: Check
+        run: cargo check
 
-      - name: Run type checking
-        run: |
-          mypy src/ --ignore-missing-imports || true
-
-      - name: Run tests
-        run: |
-          pytest tests/ -v --tb=short
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage.xml
-          fail_ci_if_error: false
+      - name: Test
+        run: cargo test

@@ -13,10 +13,9 @@ The main request path lives in `src/server.rs` and follows this sequence:
 1. Validate incoming OpenAI-style request payloads.
 2. Normalize `ResponsesRequest` payloads into the internal typed `ChatRequest` form.
 3. Resolve routing in one place:
-   - apply model overrides
-   - infer provider from configured model prefixes
+   - resolve the route via `routing.model_routes` (requested model key or `*`)
    - compute sticky-routing key from normalized message content
-   - choose a healthy account for that provider
+   - choose a healthy account for the selected provider
 4. Dispatch to the selected provider implementation.
 5. Apply success/failure health updates and sticky binding updates after execution.
 
@@ -69,9 +68,7 @@ Configuration uses a structured schema centered on:
 Key behaviors:
 
 - `accounts[]` is the source of truth for credentials.
-- `routing.model_overrides` rewrites requested models before provider resolution.
-- `routing.provider_prefixes` maps model prefixes to providers.
-- `models.compaction_model` routes compaction through the same shared routing path.
+- `routing.model_routes` maps the requested model (or `*`) to an ordered list of routing steps (physical targets and logical aliases).
 - the config file has a single current format.
 
 ## UI and config endpoint

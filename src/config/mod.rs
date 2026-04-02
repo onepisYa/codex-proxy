@@ -457,11 +457,10 @@ fn infer_openai_models_url(api_url: &str) -> Option<String> {
 pub type ProvidersConfig = HashMap<String, ProviderConfig>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelsConfig {
     #[serde(default)]
     pub served: Vec<String>,
-    #[serde(default)]
-    pub fallback_models: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -597,6 +596,22 @@ pub struct RouteTargetConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelRouteStepConfig {
+    Physical {
+        provider: String,
+        model: String,
+        #[serde(default)]
+        endpoint: Option<String>,
+        #[serde(default)]
+        reasoning: Option<RouteReasoningConfig>,
+    },
+    Logical {
+        model: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoutingHealthConfig {
     #[serde(default = "default_auth_failure_immediate_unhealthy")]
     pub auth_failure_immediate_unhealthy: bool,
@@ -610,9 +625,7 @@ pub struct RoutingHealthConfig {
 #[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
     #[serde(default)]
-    pub model_overrides: HashMap<String, String>,
-    #[serde(default, alias = "preferred_models")]
-    pub model_provider_priority: HashMap<String, Vec<RouteTargetConfig>>,
+    pub model_routes: HashMap<String, Vec<ModelRouteStepConfig>>,
 }
 
 impl Default for RoutingHealthConfig {
@@ -634,42 +647,8 @@ pub struct TimeoutsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionConfig {
     pub temperature: f64,
-    #[serde(default, deserialize_with = "deserialize_compaction_preferred_targets")]
+    #[serde(default)]
     pub preferred_targets: Vec<String>,
-}
-
-fn deserialize_compaction_preferred_targets<'de, D>(
-    deserializer: D,
-) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum PreferredTargetItem {
-        String(String),
-        Map(serde_json::Map<String, serde_json::Value>),
-    }
-
-    let raw = Vec::<PreferredTargetItem>::deserialize(deserializer)?;
-    raw.into_iter()
-        .map(|item| match item {
-            PreferredTargetItem::String(s) => Ok(s),
-            PreferredTargetItem::Map(map) => {
-                if let Some(v) = map.get("logical_model").and_then(|v| v.as_str()) {
-                    return Ok(v.to_string());
-                }
-                if let Some(v) = map.get("model").and_then(|v| v.as_str()) {
-                    return Ok(v.to_string());
-                }
-                Err(D::Error::custom(
-                    "compaction.preferred_targets entries must be a string or an object with 'logical_model' or 'model'",
-                ))
-            }
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1036,7 +1015,6 @@ impl Config {
             providers,
             models: ModelsConfig {
                 served: served_models,
-                fallback_models: HashMap::new(),
             },
             model_discovery: ModelDiscoveryConfig::default(),
             model_metadata: ProviderModelMetadataConfig::new(),
@@ -1044,8 +1022,7 @@ impl Config {
             session: SessionConfig::default(),
             auto_compaction: AutoCompactionConfig::default(),
             routing: RoutingConfig {
-                model_overrides: HashMap::new(),
-                model_provider_priority: HashMap::new(),
+                model_routes: HashMap::new(),
             },
             health: RoutingHealthConfig::default(),
             accounts,
@@ -1416,23 +1393,66 @@ impl Config {
             }
         }
 
-        for (logical_model, targets) in &self.routing.model_provider_priority {
-            if targets.is_empty() {
+        if self.routing.model_routes.is_empty() {
+            return Err(ConfigError::InvalidValue(
+                "routing.model_routes must not be empty".into(),
+            ));
+        }
+
+        for (route_key, steps) in &self.routing.model_routes {
+            if route_key.trim().is_empty() {
+                return Err(ConfigError::InvalidValue(
+                    "routing.model_routes keys must not be empty".into(),
+                ));
+            }
+            if steps.is_empty() {
                 return Err(ConfigError::InvalidValue(format!(
-                    "routing.model_provider_priority['{}'] must not be empty",
-                    logical_model
+                    "routing.model_routes['{}'] must not be empty",
+                    route_key
                 )));
             }
-            for target in targets {
-                self.validate_route_target(
-                    target,
-                    &format!("routing.model_provider_priority['{}']", logical_model),
-                )?;
+
+            for (idx, step) in steps.iter().enumerate() {
+                match step {
+                    ModelRouteStepConfig::Physical {
+                        provider,
+                        model,
+                        endpoint,
+                        reasoning,
+                    } => {
+                        let target = RouteTargetConfig {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            endpoint: endpoint.clone(),
+                            reasoning: reasoning.clone(),
+                        };
+                        self.validate_route_target(
+                            &target,
+                            &format!("routing.model_routes['{}'][{}]", route_key, idx),
+                        )?;
+                    }
+                    ModelRouteStepConfig::Logical { model } => {
+                        if model.trim().is_empty() {
+                            return Err(ConfigError::InvalidValue(format!(
+                                "routing.model_routes['{}'][{}] logical model reference must not be empty",
+                                route_key, idx
+                            )));
+                        }
+                        if !self.routing.model_routes.contains_key(model.as_str()) {
+                            return Err(ConfigError::InvalidValue(format!(
+                                "routing.model_routes['{}'][{}] references undefined logical model '{}'",
+                                route_key, idx, model
+                            )));
+                        }
+                    }
+                }
             }
-            if !self.has_compatible_enabled_account(targets) {
+
+            let targets = self.expand_model_route(route_key)?;
+            if !self.has_compatible_enabled_account(&targets) {
                 return Err(ConfigError::InvalidValue(format!(
-                    "routing.model_provider_priority['{}'] has no compatible enabled account",
-                    logical_model
+                    "routing.model_routes['{}'] has no compatible enabled account",
+                    route_key
                 )));
             }
         }
@@ -1440,46 +1460,14 @@ impl Config {
         for logical_model in &self.compaction.preferred_targets {
             if !self
                 .routing
-                .model_provider_priority
+                .model_routes
                 .contains_key(logical_model.as_str())
             {
                 return Err(ConfigError::InvalidValue(format!(
-                    "compaction.preferred_targets references logical model '{}' which is not defined in routing.model_provider_priority",
+                    "compaction.preferred_targets references logical model '{}' which is not defined in routing.model_routes",
                     logical_model
                 )));
             }
-        }
-
-        for (requested_model, mapped_model) in &self.routing.model_overrides {
-            if !self
-                .routing
-                .model_provider_priority
-                .contains_key(mapped_model)
-            {
-                return Err(ConfigError::InvalidValue(format!(
-                    "routing.model_overrides['{}'] target '{}' is not defined in routing.model_provider_priority",
-                    requested_model, mapped_model
-                )));
-            }
-            if requested_model != "*"
-                && self
-                    .routing
-                    .model_provider_priority
-                    .contains_key(requested_model)
-                && mapped_model != requested_model
-            {
-                return Err(ConfigError::InvalidValue(format!(
-                    "routing.model_overrides['{}'] conflicts with routing.model_provider_priority['{}'] (model maps to '{}' but also has direct routing targets)",
-                    requested_model, requested_model, mapped_model
-                )));
-            }
-        }
-
-        if !self.models.fallback_models.is_empty() {
-            return Err(ConfigError::InvalidValue(
-                "models.fallback_models is deprecated; use routing.model_overrides + routing.model_provider_priority instead"
-                    .to_string(),
-            ));
         }
 
         if !self.models.served.is_empty() {
@@ -1493,70 +1481,137 @@ impl Config {
 
                 let _ = logical_model;
             }
+        } else if !self.routing.model_routes.contains_key("*") {
+            return Err(ConfigError::InvalidValue(
+                "models.served is empty, so routing.model_routes must define a '*' fallback route"
+                    .into(),
+            ));
         }
 
         Ok(())
     }
 
-    pub fn resolve_logical_model(&self, requested_model: &str) -> String {
-        self.routing
-            .model_overrides
-            .get(requested_model)
-            .or_else(|| self.routing.model_overrides.get("*"))
-            .cloned()
-            .unwrap_or_else(|| requested_model.to_string())
-    }
-
     /// Resolve a request model into a routing logical model plus its target list.
     ///
     /// Resolution order:
-    /// 1) `routing.model_overrides[requested_model]` (exact)
-    /// 2) `routing.model_provider_priority[requested_model]` (treat requested as a physical routing key)
-    /// 3) `routing.model_overrides["*"]` (wildcard)
+    /// 1) `routing.model_routes[requested_model]`
+    /// 2) `routing.model_routes["*"]`
     pub fn route_targets_for_model(
         &self,
         requested_model: &str,
-    ) -> Option<(String, &[RouteTargetConfig])> {
-        if let Some(mapped_model) = self.routing.model_overrides.get(requested_model) {
-            return self
-                .routing
-                .model_provider_priority
-                .get(mapped_model)
-                .map(|targets| (mapped_model.clone(), targets.as_slice()));
-        }
+    ) -> Option<(String, Vec<RouteTargetConfig>)> {
+        let entry_key = if self.routing.model_routes.contains_key(requested_model) {
+            requested_model
+        } else if self.routing.model_routes.contains_key("*") {
+            "*"
+        } else {
+            return None;
+        };
 
-        if let Some(targets) = self.routing.model_provider_priority.get(requested_model) {
-            return Some((requested_model.to_string(), targets.as_slice()));
-        }
-
-        if let Some(mapped_model) = self.routing.model_overrides.get("*") {
-            if let Some(targets) = self.routing.model_provider_priority.get(mapped_model) {
-                return Some((mapped_model.clone(), targets.as_slice()));
-            }
-        }
-        None
+        let logical_key = self.canonical_logical_route_key(entry_key).ok()?;
+        let targets = self.expand_model_route(&logical_key).ok()?;
+        Some((logical_key, targets))
     }
 
     pub fn preferred_targets_for_model(
         &self,
         requested_model: &str,
-    ) -> Option<&[RouteTargetConfig]> {
+    ) -> Option<Vec<RouteTargetConfig>> {
         self.route_targets_for_model(requested_model)
             .map(|(_, targets)| targets)
     }
 
     pub fn compaction_targets(&self) -> Vec<RouteTargetConfig> {
-        self.compaction
-            .preferred_targets
-            .iter()
-            .filter_map(|logical_model| {
-                self.routing
-                    .model_provider_priority
-                    .get(logical_model)
-                    .cloned()
-            })
-            .flatten()
-            .collect()
+        let mut targets = Vec::new();
+        for logical_model in &self.compaction.preferred_targets {
+            if let Ok(expanded) = self.expand_model_route(logical_model) {
+                targets.extend(expanded);
+            }
+        }
+        targets
+    }
+
+    fn canonical_logical_route_key(&self, entry_key: &str) -> Result<String, ConfigError> {
+        let mut current = entry_key.to_string();
+        let mut seen = std::collections::HashSet::<String>::new();
+        loop {
+            let steps = self.routing.model_routes.get(&current).ok_or_else(|| {
+                ConfigError::InvalidValue(format!(
+                    "routing.model_routes references undefined model route '{}'",
+                    current
+                ))
+            })?;
+            if steps.len() != 1 {
+                return Ok(current);
+            }
+            let ModelRouteStepConfig::Logical { model: next } = &steps[0] else {
+                return Ok(current);
+            };
+
+            if !seen.insert(current.clone()) {
+                return Err(ConfigError::InvalidValue(format!(
+                    "routing.model_routes contains a logical cycle involving '{}'",
+                    current
+                )));
+            }
+            current = next.clone();
+        }
+    }
+
+    fn expand_model_route(&self, route_key: &str) -> Result<Vec<RouteTargetConfig>, ConfigError> {
+        let mut stack = Vec::new();
+        let targets = self.expand_model_route_inner(route_key, &mut stack)?;
+        if targets.is_empty() {
+            return Err(ConfigError::InvalidValue(format!(
+                "routing.model_routes['{}'] expands to zero physical targets",
+                route_key
+            )));
+        }
+        Ok(targets)
+    }
+
+    fn expand_model_route_inner(
+        &self,
+        route_key: &str,
+        stack: &mut Vec<String>,
+    ) -> Result<Vec<RouteTargetConfig>, ConfigError> {
+        if stack.iter().any(|k| k == route_key) {
+            stack.push(route_key.to_string());
+            return Err(ConfigError::InvalidValue(format!(
+                "routing.model_routes contains a logical cycle: {}",
+                stack.join(" -> ")
+            )));
+        }
+
+        let steps = self.routing.model_routes.get(route_key).ok_or_else(|| {
+            ConfigError::InvalidValue(format!(
+                "routing.model_routes references undefined logical model '{}'",
+                route_key
+            ))
+        })?;
+
+        stack.push(route_key.to_string());
+        let mut out = Vec::new();
+        for step in steps {
+            match step {
+                ModelRouteStepConfig::Physical {
+                    provider,
+                    model,
+                    endpoint,
+                    reasoning,
+                } => out.push(RouteTargetConfig {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    endpoint: endpoint.clone(),
+                    reasoning: reasoning.clone(),
+                }),
+                ModelRouteStepConfig::Logical { model } => {
+                    out.extend(self.expand_model_route_inner(model.as_str(), stack)?);
+                }
+            }
+        }
+        stack.pop();
+        Ok(out)
     }
 
     pub fn recovery_probe_target(&self, provider: &str) -> Option<RouteTargetConfig> {
@@ -1894,7 +1949,6 @@ mod tests {
             ]),
             models: ModelsConfig {
                 served: vec!["claude-sonnet-4-6".into()],
-                fallback_models: HashMap::new(),
             },
             model_discovery: ModelDiscoveryConfig::default(),
             model_metadata: ProviderModelMetadataConfig::new(),
@@ -1902,10 +1956,9 @@ mod tests {
             session: SessionConfig::default(),
             auto_compaction: AutoCompactionConfig::default(),
             routing: RoutingConfig {
-                model_overrides: HashMap::new(),
-                model_provider_priority: HashMap::from([(
+                model_routes: HashMap::from([(
                     "claude-sonnet-4-6".into(),
-                    vec![RouteTargetConfig {
+                    vec![ModelRouteStepConfig::Physical {
                         provider: "tabcode".into(),
                         model: "gpt-4.1".into(),
                         endpoint: None,
@@ -1958,7 +2011,8 @@ mod tests {
     #[test]
     fn resolves_effective_reasoning_from_preset_override() {
         let cfg = base_config();
-        let target = &cfg.routing.model_provider_priority["claude-sonnet-4-6"][0];
+        let (_, targets) = cfg.route_targets_for_model("claude-sonnet-4-6").unwrap();
+        let target = &targets[0];
         let reasoning = cfg
             .resolve_reasoning(target.reasoning.as_ref())
             .unwrap()
@@ -1982,31 +2036,13 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_legacy_preferred_models_alias() {
-        let routing: RoutingConfig = serde_json::from_value(serde_json::json!({
-            "preferred_models": {
-                "claude-sonnet-4-6": [
-                    { "provider": "tabcode", "model": "gpt-4.1" }
-                ]
-            }
-        }))
-        .unwrap();
-
-        assert!(
-            routing
-                .model_provider_priority
-                .contains_key("claude-sonnet-4-6")
-        );
-    }
-
-    #[test]
-    fn serializes_routing_with_new_field_name_only() {
+    fn serializes_routing_with_model_routes_only() {
         let cfg = base_config();
         let value = serde_json::to_value(&cfg.routing).unwrap();
 
-        assert!(value.get("model_provider_priority").is_some());
-        assert!(value.get("preferred_models").is_none());
-        assert!(value.get("health").is_none());
+        assert!(value.get("model_routes").is_some());
+        assert!(value.get("model_provider_priority").is_none());
+        assert!(value.get("model_overrides").is_none());
     }
 
     #[test]
@@ -2040,14 +2076,12 @@ mod tests {
                 }
             },
             "models": {
-                "served": ["claude-sonnet-4-6"],
-                "fallback_models": {}
+                "served": ["claude-sonnet-4-6"]
             },
             "routing": {
-                "model_overrides": {},
-                "model_provider_priority": {
+                "model_routes": {
                     "claude-sonnet-4-6": [
-                        { "provider": "tabcode", "model": "gpt-4.1" }
+                        { "type": "physical", "provider": "tabcode", "model": "gpt-4.1" }
                     ]
                 },
             },
@@ -2091,7 +2125,7 @@ mod tests {
         assert!(
             persisted
                 .routing
-                .model_provider_priority
+                .model_routes
                 .contains_key("claude-sonnet-4-6")
         );
     }
@@ -2113,14 +2147,12 @@ mod tests {
                 }
             },
             "models": {
-                "served": ["claude-sonnet-4-6"],
-                "fallback_models": {}
+                "served": ["claude-sonnet-4-6"]
             },
             "routing": {
-                "model_overrides": {},
-                "model_provider_priority": {
+                "model_routes": {
                     "claude-sonnet-4-6": [
-                        { "provider": "tabcode", "model": "gpt-4.1" }
+                        { "type": "physical", "provider": "tabcode", "model": "gpt-4.1" }
                     ]
                 },
                 "health": {
@@ -2176,14 +2208,12 @@ mod tests {
                 }
             },
             "models": {
-                "served": ["claude-sonnet-4-6"],
-                "fallback_models": {}
+                "served": ["claude-sonnet-4-6"]
             },
             "routing": {
-                "model_overrides": {},
-                "model_provider_priority": {
+                "model_routes": {
                     "claude-sonnet-4-6": [
-                        { "provider": "tabcode", "model": "gpt-4.1" }
+                        { "type": "physical", "provider": "tabcode", "model": "gpt-4.1" }
                     ]
                 },
                 "sticky_routing": {
@@ -2221,97 +2251,16 @@ mod tests {
     }
 
     #[test]
-    fn exact_model_override_beats_wildcard() {
+    fn wildcard_route_can_be_logical_alias() {
         let mut cfg = base_config();
-        cfg.routing.model_overrides = HashMap::from([
-            ("*".into(), "fallback-logical".into()),
-            ("claude-sonnet-4-6".into(), "exact-logical".into()),
-        ]);
-
-        assert_eq!(
-            cfg.resolve_logical_model("claude-sonnet-4-6"),
-            "exact-logical"
-        );
-    }
-
-    #[test]
-    fn wildcard_model_override_applies_when_exact_is_missing() {
-        let mut cfg = base_config();
-        cfg.routing.model_overrides = HashMap::from([("*".into(), "claude-sonnet-4-6".into())]);
-
-        assert_eq!(
-            cfg.resolve_logical_model("unmapped-model"),
-            "claude-sonnet-4-6"
-        );
-    }
-
-    #[test]
-    fn wildcard_override_target_must_exist_in_model_provider_priority() {
-        let mut cfg = base_config();
-        cfg.routing.model_overrides = HashMap::from([("*".into(), "missing-logical".into())]);
-
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("routing.model_overrides['*'] target 'missing-logical' is not defined in routing.model_provider_priority"));
-    }
-
-    #[test]
-    fn preferred_targets_use_wildcard_resolved_logical_model() {
-        let mut cfg = base_config();
-        cfg.routing.model_overrides = HashMap::from([("*".into(), "claude-sonnet-4-6".into())]);
-
-        let targets = cfg.preferred_targets_for_model("unmapped-model").unwrap();
-        assert_eq!(targets[0].provider, "tabcode");
-        assert_eq!(targets[0].model, "gpt-4.1");
-    }
-
-    #[test]
-    fn preferred_targets_use_physical_key_before_wildcard_override() {
-        let mut cfg = base_config();
-        cfg.routing.model_overrides = HashMap::from([("*".into(), "claude-sonnet-4-6".into())]);
-        cfg.routing.model_provider_priority.insert(
-            "gpt-4.1-mini".into(),
-            vec![RouteTargetConfig {
-                provider: "openai".into(),
-                model: "gpt-4.1-mini".into(),
-                endpoint: None,
-                reasoning: None,
+        cfg.routing.model_routes.insert(
+            "*".into(),
+            vec![ModelRouteStepConfig::Logical {
+                model: "claude-sonnet-4-6".into(),
             }],
         );
 
-        let (logical_model, targets) = cfg.route_targets_for_model("gpt-4.1-mini").unwrap();
-        assert_eq!(logical_model, "gpt-4.1-mini");
-        assert_eq!(targets[0].provider, "openai");
-        assert_eq!(targets[0].model, "gpt-4.1-mini");
-    }
-
-    #[test]
-    fn preferred_targets_exact_override_beats_physical_key() {
-        let mut cfg = base_config();
-        cfg.routing.model_overrides =
-            HashMap::from([("gpt-4.1-mini".into(), "claude-sonnet-4-6".into())]);
-        cfg.routing.model_provider_priority.insert(
-            "gpt-4.1-mini".into(),
-            vec![RouteTargetConfig {
-                provider: "openai".into(),
-                model: "gpt-4.1-mini".into(),
-                endpoint: None,
-                reasoning: None,
-            }],
-        );
-
-        let (logical_model, targets) = cfg.route_targets_for_model("gpt-4.1-mini").unwrap();
-        assert_eq!(logical_model, "claude-sonnet-4-6");
-        assert_eq!(targets[0].provider, "tabcode");
-        assert_eq!(targets[0].model, "gpt-4.1");
-    }
-
-    #[test]
-    fn route_targets_use_wildcard_override_when_no_physical_entry() {
-        let mut cfg = base_config();
-        cfg.routing
-            .model_overrides
-            .insert("*".into(), "claude-sonnet-4-6".into());
-
+        cfg.validate().unwrap();
         let (logical_model, targets) = cfg.route_targets_for_model("unmapped-model").unwrap();
         assert_eq!(logical_model, "claude-sonnet-4-6");
         assert_eq!(targets[0].provider, "tabcode");
@@ -2319,27 +2268,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fallback_models_config() {
+    fn route_steps_support_physical_then_logical_fallback() {
         let mut cfg = base_config();
-        cfg.models
-            .fallback_models
-            .insert("*".into(), "claude-sonnet-4-6".into());
-
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("models.fallback_models is deprecated"));
-    }
-
-    #[test]
-    fn model_overrides_conflicts_with_direct_physical_entry() {
-        let mut cfg = base_config();
-        cfg.routing.model_provider_priority.insert(
+        cfg.routing.model_routes.insert(
             "gpt-4.1-mini".into(),
-            vec![RouteTargetConfig {
-                provider: "openai".into(),
-                model: "gpt-4.1-mini".into(),
-                endpoint: None,
-                reasoning: None,
-            }],
+            vec![
+                ModelRouteStepConfig::Physical {
+                    provider: "openai".into(),
+                    model: "gpt-4.1-mini".into(),
+                    endpoint: None,
+                    reasoning: None,
+                },
+                ModelRouteStepConfig::Logical {
+                    model: "claude-sonnet-4-6".into(),
+                },
+            ],
         );
         cfg.accounts.push(AccountConfig {
             id: "openai-a".into(),
@@ -2351,12 +2294,48 @@ mod tests {
                 api_key: "sk-test".into(),
             },
         });
-        cfg.routing
-            .model_overrides
-            .insert("gpt-4.1-mini".into(), "claude-sonnet-4-6".into());
+
+        cfg.validate().unwrap();
+        let (logical_model, targets) = cfg.route_targets_for_model("gpt-4.1-mini").unwrap();
+        assert_eq!(logical_model, "gpt-4.1-mini");
+        assert_eq!(targets[0].provider, "openai");
+        assert_eq!(targets[0].model, "gpt-4.1-mini");
+        assert_eq!(targets[1].provider, "tabcode");
+        assert_eq!(targets[1].model, "gpt-4.1");
+    }
+
+    #[test]
+    fn rejects_missing_logical_reference() {
+        let mut cfg = base_config();
+        cfg.routing.model_routes.insert(
+            "*".into(),
+            vec![ModelRouteStepConfig::Logical {
+                model: "missing-logical".into(),
+            }],
+        );
 
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("routing.model_overrides['gpt-4.1-mini'] conflicts with routing.model_provider_priority['gpt-4.1-mini']"));
+        assert!(err.contains("references undefined logical model 'missing-logical'"));
+    }
+
+    #[test]
+    fn rejects_logical_cycle() {
+        let mut cfg = base_config();
+        cfg.models.served = vec!["a".into()];
+        cfg.compaction.preferred_targets = Vec::new();
+        cfg.routing.model_routes = HashMap::from([
+            (
+                "a".into(),
+                vec![ModelRouteStepConfig::Logical { model: "b".into() }],
+            ),
+            (
+                "b".into(),
+                vec![ModelRouteStepConfig::Logical { model: "a".into() }],
+            ),
+        ]);
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("logical cycle"));
     }
 
     #[test]
@@ -2372,9 +2351,9 @@ mod tests {
                 max_tokens_cap: None,
             },
         );
-        cfg.routing.model_provider_priority.insert(
+        cfg.routing.model_routes.insert(
             "route-only-logical".into(),
-            vec![RouteTargetConfig {
+            vec![ModelRouteStepConfig::Physical {
                 provider: "route-only".into(),
                 model: "routed-model".into(),
                 endpoint: None,
@@ -2455,20 +2434,17 @@ mod tests {
     }
 
     #[test]
-    fn preferred_targets_accept_string_or_object() {
-        let compaction: CompactionConfig = serde_json::from_value(serde_json::json!({
+    fn preferred_targets_rejects_object_items() {
+        let err = serde_json::from_value::<CompactionConfig>(serde_json::json!({
             "temperature": 0.1,
             "preferred_targets": [
               "glm-5-turbo",
-              { "model": "claude-sonnet-4-6" },
-              { "logical_model": "gpt-5" }
+              { "model": "claude-sonnet-4-6" }
             ]
         }))
-        .expect("compaction config must parse");
+        .unwrap_err()
+        .to_string();
 
-        assert_eq!(
-            compaction.preferred_targets,
-            vec!["glm-5-turbo", "claude-sonnet-4-6", "gpt-5"]
-        );
+        assert!(err.contains("expected a string"));
     }
 }

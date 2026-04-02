@@ -98,24 +98,21 @@ Top-level sections:
     }
   },
   "models": {
-    "served": ["claude-sonnet-4-6", "claude-fast", "compact-default"],
-    "fallback_models": {
-      "claude-fast": "claude-sonnet-4-6"
-    }
+    "served": ["claude-sonnet-4-6", "claude-fast", "compact-default"]
   },
   "routing": {
-    "model_overrides": {
-      "claude-fast": "claude-sonnet-4-6",
-      "*": "claude-sonnet-4-6"
-    },
-    "model_provider_priority": {
+    "model_routes": {
+      "claude-fast": [{ "type": "logical", "model": "claude-sonnet-4-6" }],
+      "*": [{ "type": "logical", "model": "claude-sonnet-4-6" }],
       "claude-sonnet-4-6": [
         {
+          "type": "physical",
           "provider": "open_ai",
           "model": "gpt-4.1",
           "reasoning": { "effort": "medium" }
         },
         {
+          "type": "physical",
           "provider": "gemini",
           "model": "gemini-2.5-pro",
           "reasoning": { "effort": "high" }
@@ -123,6 +120,7 @@ Top-level sections:
       ],
       "compact-default": [
         {
+          "type": "physical",
           "provider": "open_ai",
           "model": "gpt-4.1-mini",
           "reasoning": { "effort": "none" }
@@ -177,27 +175,16 @@ Top-level sections:
   },
   "compaction": {
     "temperature": 0.1,
-    "preferred_targets": [
-      {
-        "provider": "open_ai",
-        "model": "gpt-4.1-mini",
-        "reasoning": { "effort": "none" }
-      },
-      {
-        "provider": "gemini",
-        "model": "gemini-2.5-flash",
-        "reasoning": { "effort": "minimal" }
-      }
-    ]
+    "preferred_targets": ["compact-default"]
   }
 }
 ```
 
 ### Routing model
 
-- `routing.model_provider_priority[logical_model]` is the canonical ordered list of route targets.
-- Each route target picks one upstream provider and one upstream model.
-- `routing.model_overrides` maps requested models onto logical routing entries. Exact matches win first, then a literal `"*"` wildcard applies, and the resolved logical model is looked up in `routing.model_provider_priority`.
+- `routing.model_routes[logical_model]` is the canonical ordered list of route steps.
+- A route step is either `{"type":"physical", ...}` (an upstream `(provider, model)` target), or `{"type":"logical", ...}` (a reference to another `routing.model_routes` key).
+- Routing resolves `routing.model_routes[requested_model]` first, then falls back to `routing.model_routes["*"]`.
 - Sticky routing is always enabled and reuses the exact chosen `(provider, model, account)` path when it is still healthy.
 - If the sticky-bound path is unhealthy, routing falls through to the next compatible preferred target.
 - `accounts[].models`, when omitted, means the account can use any model from that provider's catalog.
@@ -219,8 +206,7 @@ Top-level sections:
 - `accounts[]` is the source of truth for upstream credentials.
 - Gemini supports either `api_key` or `gemini_oauth` account auth.
 - Z.AI and OpenAI currently use straightforward account-scoped API-key auth.
-- `routing.model_overrides` maps user-facing requested models to logical routing entries. Exact matches win first, then a literal `"*"` wildcard applies, otherwise the requested model is used unchanged.
-- Compaction uses the same ordered route planning path as normal responses, but with `compaction.preferred_targets`.
+- Compaction uses the same ordered route planning path as normal responses, but starts from `compaction.preferred_targets` (logical model names).
 - Auto-compaction prompt text is embedded in the binary; config only controls whether it runs and how aggressively it trims.
 - The OpenAI provider intentionally forwards requests upstream with minimal transformation: it swaps in the resolved upstream model and configured account auth, then forwards the OpenAI-shaped payload.
 
