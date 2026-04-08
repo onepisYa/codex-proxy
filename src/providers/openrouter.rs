@@ -8,7 +8,7 @@ use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
 
 use super::openai::{
     OpenAiCompactPayload, OpenAiProvider, build_openai_payload, clamp_compact_payload_max_tokens,
-    clamp_payload_max_tokens, reasoning_effort, OpenAiReasoning,
+    clamp_payload_max_tokens, coerce_items_input_to_text, reasoning_effort, OpenAiReasoning,
 };
 
 pub struct OpenRouterProvider {
@@ -43,6 +43,7 @@ impl Provider for OpenRouterProvider {
         let default_max_output_tokens = resolve_openrouter_default_max_output_tokens(&context);
         let mut payload =
             build_openai_payload(&raw_request, &context, Some(default_max_output_tokens));
+        coerce_items_input_to_text(&mut payload);
         clamp_payload_max_tokens(&mut payload, &context);
 
         Box::pin(async move { inner.forward_json(&payload, headers, &context).await })

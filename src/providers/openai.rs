@@ -10,7 +10,7 @@ use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::openai::{
     ChatRequest, CompactRequest, Instructions, ResponsesInput, ResponsesRequest, Tool,
-    messages_to_input_items,
+    input_items_to_text, messages_to_input_items,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -428,6 +428,14 @@ pub(crate) fn resolve_input_for_payload(request: &ResponsesRequest) -> Option<Re
         .messages
         .as_ref()
         .map(|messages| ResponsesInput::Items(messages_to_input_items(messages)))
+}
+
+pub(crate) fn coerce_items_input_to_text(payload: &mut OpenAiResponsesPayload) {
+    let Some(input) = payload.input.take() else { return };
+    payload.input = Some(match input {
+        ResponsesInput::Items(items) => ResponsesInput::Text(input_items_to_text(&items)),
+        other => other,
+    });
 }
 
 pub(crate) fn reasoning_effort(reasoning: &EffectiveReasoningConfig) -> &'static str {

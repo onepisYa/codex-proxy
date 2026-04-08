@@ -385,3 +385,144 @@ fn chat_content_to_content(content: &ChatContent) -> Content {
         ),
     }
 }
+
+pub fn responses_input_to_text(input: &ResponsesInput) -> String {
+    match input {
+        ResponsesInput::Text(text) => text.clone(),
+        ResponsesInput::Items(items) => input_items_to_text(items),
+    }
+}
+
+pub fn input_items_to_text(items: &[InputItem]) -> String {
+    let mut out = String::new();
+    for item in items {
+        match item.item_type.as_str() {
+            "message" => {
+                let role = item.role.as_deref().unwrap_or("user");
+                let content = item
+                    .content
+                    .as_ref()
+                    .map(content_to_text)
+                    .unwrap_or_default();
+                push_line(&mut out, &format!("{role}: {content}"));
+                if let Some(reasoning) = item.reasoning_content.as_deref() {
+                    if !reasoning.is_empty() {
+                        push_line(&mut out, &format!("{role} (reasoning): {reasoning}"));
+                    }
+                }
+            }
+            "function_call" => {
+                let name = item.name.as_deref().unwrap_or("function");
+                let args = item
+                    .arguments
+                    .as_ref()
+                    .map(value_to_text)
+                    .unwrap_or_default();
+                push_line(&mut out, &format!("tool {name} call: {args}"));
+            }
+            "function_call_output" => {
+                let name = item.name.as_deref().unwrap_or("function");
+                let output = item
+                    .output
+                    .as_ref()
+                    .map(content_to_text)
+                    .unwrap_or_default();
+                push_line(&mut out, &format!("tool {name} output: {output}"));
+            }
+            _ => {
+                let content = item
+                    .content
+                    .as_ref()
+                    .map(content_to_text)
+                    .unwrap_or_default();
+                let label = if item.item_type.is_empty() {
+                    "item"
+                } else {
+                    item.item_type.as_str()
+                };
+                if content.is_empty() {
+                    push_line(&mut out, label);
+                } else {
+                    push_line(&mut out, &format!("{label}: {content}"));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn content_to_text(content: &Content) -> String {
+    match content {
+        Content::Text(text) => text.clone(),
+        Content::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| part.text.as_deref())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(""),
+        Content::Json(value) => value_to_text(value),
+    }
+}
+
+fn value_to_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        _ => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+fn push_line(out: &mut String, line: &str) {
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(line);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Content, InputItem, ResponsesInput, input_items_to_text, responses_input_to_text};
+
+    #[test]
+    fn input_items_to_text_preserves_role_and_tool() {
+        let mut message = blank_item("message");
+        message.role = Some("user".into());
+        message.content = Some(Content::Text("hello".into()));
+
+        let mut tool_call = blank_item("function_call");
+        tool_call.name = Some("lookup".into());
+        tool_call.arguments = Some(serde_json::Value::String("{\"q\":\"x\"}".into()));
+
+        let items = vec![message, tool_call];
+        let text = input_items_to_text(&items);
+        assert!(text.contains("user: hello"));
+        assert!(text.contains("tool lookup call: {\"q\":\"x\"}"));
+
+        let wrapped = responses_input_to_text(&ResponsesInput::Items(items));
+        assert!(wrapped.contains("user: hello"));
+    }
+
+    fn blank_item(item_type: &str) -> InputItem {
+        InputItem {
+            item_type: item_type.into(),
+            id: None,
+            call_id: None,
+            role: None,
+            name: None,
+            content: None,
+            reasoning_content: None,
+            thought_signature: None,
+            thought: None,
+            arguments: None,
+            input: None,
+            action: None,
+            command: None,
+            cwd: None,
+            working_directory: None,
+            changes: None,
+            output: None,
+            stdout: None,
+            stderr: None,
+            encrypted_content: None,
+        }
+    }
+}
