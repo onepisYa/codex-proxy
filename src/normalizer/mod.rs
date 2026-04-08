@@ -41,6 +41,8 @@ pub fn normalize(req: ResponsesRequest) -> ChatRequest {
                 }
             }
         }
+    } else if let Some(messages_input) = &req.messages {
+        messages.extend(messages_input.clone());
     }
 
     let tools = req

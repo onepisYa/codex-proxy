@@ -141,6 +141,7 @@ async fn run_recovery_probe_pass(state: &AppState) {
             input: Some(crate::schema::openai::ResponsesInput::Text(
                 "health check".into(),
             )),
+            messages: None,
             instructions: None,
             previous_response_id: None,
             store: Some(false),
@@ -150,6 +151,7 @@ async fn run_recovery_probe_pass(state: &AppState) {
             temperature: None,
             top_p: None,
             max_tokens: (provider_name == "openrouter").then_some(1),
+            max_output_tokens: None,
             stream: Some(false),
             include: None,
         };
@@ -587,6 +589,7 @@ async fn compact_handler(
     let normalized = normalizer::normalize(ResponsesRequest {
         model: "__compaction__".to_string(),
         input: Some(data.input.clone()),
+        messages: None,
         instructions: None,
         previous_response_id: None,
         store: None,
@@ -596,6 +599,7 @@ async fn compact_handler(
         temperature: None,
         top_p: None,
         max_tokens: None,
+        max_output_tokens: None,
         stream: Some(false),
         include: None,
     });
@@ -1020,6 +1024,7 @@ async fn run_summary_compaction(
     let raw = ResponsesRequest {
         model: "__compaction__".into(),
         input: Some(crate::schema::openai::ResponsesInput::Text(prompt)),
+        messages: None,
         instructions: None,
         previous_response_id: None,
         store: Some(false),
@@ -1029,6 +1034,7 @@ async fn run_summary_compaction(
         temperature: Some(0.1),
         top_p: None,
         max_tokens: Some(4096),
+        max_output_tokens: None,
         stream: Some(false),
         include: None,
     };
@@ -1388,6 +1394,7 @@ mod auto_compaction_tests {
             input: Some(crate::schema::openai::ResponsesInput::Text(
                 "health check".into(),
             )),
+            messages: None,
             instructions: None,
             previous_response_id: None,
             store: Some(false),
@@ -1397,6 +1404,7 @@ mod auto_compaction_tests {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            max_output_tokens: None,
             stream: Some(false),
             include: None,
         };

@@ -1,15 +1,14 @@
 use axum::body::Body;
 use axum::http::HeaderMap;
 use axum::response::Response;
-use serde_json::{Value, json};
 
 use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
 
 use super::openai::{
-    OpenAiProvider, apply_openai_route_overrides, clamp_max_tokens, ensure_max_output_tokens,
-    strip_null_object_fields,
+    OpenAiCompactPayload, OpenAiProvider, build_openai_payload, clamp_compact_payload_max_tokens,
+    clamp_payload_max_tokens, reasoning_effort, OpenAiReasoning,
 };
 
 pub struct OpenRouterProvider {
@@ -41,16 +40,12 @@ impl Provider for OpenRouterProvider {
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
         let inner = self.inner.clone();
+        let default_max_output_tokens = resolve_openrouter_default_max_output_tokens(&context);
         let mut payload =
-            serde_json::to_value(raw_request).unwrap_or_else(|_| Value::Object(Default::default()));
+            build_openai_payload(&raw_request, &context, Some(default_max_output_tokens));
+        clamp_payload_max_tokens(&mut payload, &context);
 
-        strip_null_object_fields(&mut payload);
-        ensure_max_output_tokens(&mut payload);
-        ensure_openrouter_default_max_output_tokens(&mut payload, &context);
-        clamp_max_tokens(&mut payload, &context);
-        apply_openai_route_overrides(&mut payload, &context);
-
-        Box::pin(async move { inner.forward_json(payload, headers, &context).await })
+        Box::pin(async move { inner.forward_json(&payload, headers, &context).await })
     }
 
     fn handle_compact(
@@ -62,17 +57,22 @@ impl Provider for OpenRouterProvider {
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
         let inner = self.inner.clone();
-        let mut payload = json!({
-            "model": context.upstream_model(),
-            "input": data.input,
-            "instructions": data.instructions,
-            "store": false,
-            "max_output_tokens": 4096,
-            "stream": false
-        });
-        clamp_max_tokens(&mut payload, &context);
-        apply_openai_route_overrides(&mut payload, &context);
-        Box::pin(async move { inner.forward_json(payload, headers, &context).await })
+        let default_max_output_tokens = resolve_openrouter_default_max_output_tokens(&context);
+        let mut payload = OpenAiCompactPayload {
+            model: context.upstream_model().to_string(),
+            input: data.input,
+            instructions: data.instructions,
+            store: false,
+            temperature: None,
+            max_tokens: Some(4096),
+            max_output_tokens: Some(default_max_output_tokens),
+            stream: false,
+            reasoning: context.reasoning().map(|reasoning| OpenAiReasoning {
+                effort: reasoning_effort(reasoning),
+            }),
+        };
+        clamp_compact_payload_max_tokens(&mut payload, &context);
+        Box::pin(async move { inner.forward_json(&payload, headers, &context).await })
     }
 
     fn list_models(
@@ -89,25 +89,11 @@ impl Provider for OpenRouterProvider {
     }
 }
 
-fn ensure_openrouter_default_max_output_tokens(
-    payload: &mut Value,
-    context: &ProviderExecutionContext,
-) {
-    let Some(object) = payload.as_object_mut() else {
-        return;
-    };
-    if object.contains_key("max_output_tokens") {
-        return;
-    }
-
-    let default_max_output_tokens = crate::config::with_config(&context.config, |cfg| {
+fn resolve_openrouter_default_max_output_tokens(context: &ProviderExecutionContext) -> u64 {
+    crate::config::with_config(&context.config, |cfg| {
         cfg.model_metadata(context.provider(), context.upstream_model())
             .and_then(|metadata| metadata.max_output_tokens)
+            .map(u64::from)
             .unwrap_or(4096)
-    });
-
-    object.insert(
-        "max_output_tokens".to_string(),
-        Value::Number(default_max_output_tokens.into()),
-    );
+    })
 }

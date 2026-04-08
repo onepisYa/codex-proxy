@@ -8,6 +8,8 @@ pub struct ResponsesRequest {
 
     #[serde(default)]
     pub input: Option<ResponsesInput>,
+    #[serde(default)]
+    pub messages: Option<Vec<ChatMessage>>,
 
     #[serde(default)]
     pub instructions: Option<Instructions>,
@@ -35,6 +37,8 @@ pub struct ResponsesRequest {
 
     #[serde(default)]
     pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 
     #[serde(default)]
     pub stream: Option<bool>,
@@ -272,4 +276,112 @@ pub struct ToolCall {
 pub struct ToolCallFunction {
     pub name: String,
     pub arguments: String,
+}
+
+pub fn messages_to_input_items(messages: &[ChatMessage]) -> Vec<InputItem> {
+    let mut out = Vec::new();
+    for message in messages {
+        let role = if message.role == "developer" {
+            "system".to_string()
+        } else {
+            message.role.clone()
+        };
+
+        if role == "tool" {
+            out.push(InputItem {
+                item_type: "function_call_output".into(),
+                id: None,
+                call_id: message.tool_call_id.clone(),
+                role: None,
+                name: message.name.clone(),
+                content: None,
+                reasoning_content: None,
+                thought_signature: None,
+                thought: None,
+                arguments: None,
+                input: None,
+                action: None,
+                command: None,
+                cwd: None,
+                working_directory: None,
+                changes: None,
+                output: message
+                    .content
+                    .as_ref()
+                    .map(|content| chat_content_to_content(content)),
+                stdout: None,
+                stderr: None,
+                encrypted_content: None,
+            });
+            continue;
+        }
+
+        out.push(InputItem {
+            item_type: "message".into(),
+            id: None,
+            call_id: None,
+            role: Some(role),
+            name: message.name.clone(),
+            content: message
+                .content
+                .as_ref()
+                .map(|content| chat_content_to_content(content)),
+            reasoning_content: message.reasoning_content.clone(),
+            thought_signature: message.thought_signature.clone(),
+            thought: None,
+            arguments: None,
+            input: None,
+            action: None,
+            command: None,
+            cwd: None,
+            working_directory: None,
+            changes: None,
+            output: None,
+            stdout: None,
+            stderr: None,
+            encrypted_content: None,
+        });
+
+        for tool_call in &message.tool_calls {
+            out.push(InputItem {
+                item_type: "function_call".into(),
+                id: Some(tool_call.id.clone()),
+                call_id: None,
+                role: None,
+                name: Some(tool_call.function.name.clone()),
+                content: None,
+                reasoning_content: None,
+                thought_signature: message.thought_signature.clone(),
+                thought: None,
+                arguments: Some(Value::String(tool_call.function.arguments.clone())),
+                input: None,
+                action: None,
+                command: None,
+                cwd: None,
+                working_directory: None,
+                changes: None,
+                output: None,
+                stdout: None,
+                stderr: None,
+                encrypted_content: None,
+            });
+        }
+    }
+    out
+}
+
+fn chat_content_to_content(content: &ChatContent) -> Content {
+    match content {
+        ChatContent::Text(text) => Content::Text(text.clone()),
+        ChatContent::Parts(parts) => Content::Parts(
+            parts
+                .iter()
+                .map(|part| ContentPart {
+                    part_type: part.part_type.clone(),
+                    text: part.text.clone(),
+                    image_url: part.image_url.clone(),
+                })
+                .collect(),
+        ),
+    }
 }

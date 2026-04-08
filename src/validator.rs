@@ -19,9 +19,21 @@ pub fn validate_responses_request(req: &ResponsesRequest) -> Result<(), ProxyErr
             )));
         }
     }
+    if let Some(mo) = req.max_output_tokens {
+        if !(1..=128_000).contains(&mo) {
+            return Err(ProxyError::Validation(format!(
+                "max_output_tokens must be between 1 and 128000, got: {mo}"
+            )));
+        }
+    }
 
     if let Some(input) = &req.input {
         validate_input(input)?;
+    }
+    if req.input.is_none() && req.messages.is_none() {
+        return Err(ProxyError::Validation(
+            "request.input or request.messages is required".into(),
+        ));
     }
 
     if let Some(tools) = &req.tools {
