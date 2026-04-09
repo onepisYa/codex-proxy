@@ -6,9 +6,11 @@ use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
 
+use fp_agent::providers::openai::OpenAiReasoning;
+use fp_agent::providers::openrouter::{build_openrouter_compact_payload, build_openrouter_payload};
+
 use super::openai::{
-    OpenAiCompactPayload, OpenAiProvider, build_openai_payload, clamp_compact_payload_max_tokens,
-    clamp_payload_max_tokens, coerce_items_input_to_text, reasoning_effort, OpenAiReasoning,
+    OpenAiProvider, clamp_compact_payload_max_tokens, clamp_payload_max_tokens, reasoning_effort,
 };
 
 pub struct OpenRouterProvider {
@@ -41,9 +43,14 @@ impl Provider for OpenRouterProvider {
     > {
         let inner = self.inner.clone();
         let default_max_output_tokens = resolve_openrouter_default_max_output_tokens(&context);
-        let mut payload =
-            build_openai_payload(&raw_request, &context, Some(default_max_output_tokens));
-        coerce_items_input_to_text(&mut payload);
+        let mut payload = build_openrouter_payload(
+            &raw_request,
+            context.upstream_model(),
+            context.reasoning().map(|reasoning| OpenAiReasoning {
+                effort: reasoning_effort(reasoning),
+            }),
+            default_max_output_tokens,
+        );
         clamp_payload_max_tokens(&mut payload, &context);
 
         Box::pin(async move { inner.forward_json(&payload, headers, &context).await })
@@ -59,19 +66,16 @@ impl Provider for OpenRouterProvider {
     > {
         let inner = self.inner.clone();
         let default_max_output_tokens = resolve_openrouter_default_max_output_tokens(&context);
-        let mut payload = OpenAiCompactPayload {
-            model: context.upstream_model().to_string(),
-            input: data.input,
-            instructions: data.instructions,
-            store: false,
-            temperature: None,
-            max_tokens: Some(4096),
-            max_output_tokens: Some(default_max_output_tokens),
-            stream: false,
-            reasoning: context.reasoning().map(|reasoning| OpenAiReasoning {
+        let mut payload = build_openrouter_compact_payload(
+            &data,
+            context.upstream_model(),
+            context.reasoning().map(|reasoning| OpenAiReasoning {
                 effort: reasoning_effort(reasoning),
             }),
-        };
+            Some(4096),
+            Some(default_max_output_tokens),
+            None,
+        );
         clamp_compact_payload_max_tokens(&mut payload, &context);
         Box::pin(async move { inner.forward_json(&payload, headers, &context).await })
     }

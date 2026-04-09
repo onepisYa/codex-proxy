@@ -185,6 +185,10 @@ pub struct OpenAiProviderConfig {
     pub models: Vec<String>,
     #[serde(default)]
     pub max_tokens_cap: Option<u64>,
+    #[serde(default)]
+    pub auth_header: Option<String>,
+    #[serde(default)]
+    pub auth_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +222,10 @@ pub enum ProviderConfig {
         models: Vec<String>,
         #[serde(default)]
         max_tokens_cap: Option<u64>,
+        #[serde(default)]
+        auth_header: Option<String>,
+        #[serde(default)]
+        auth_prefix: Option<String>,
     },
     #[serde(rename = "openrouter", alias = "open_router")]
     OpenRouter {
@@ -230,6 +238,10 @@ pub enum ProviderConfig {
         models: Vec<String>,
         #[serde(default)]
         max_tokens_cap: Option<u64>,
+        #[serde(default)]
+        auth_header: Option<String>,
+        #[serde(default)]
+        auth_prefix: Option<String>,
     },
 }
 
@@ -296,12 +308,16 @@ impl ProviderConfig {
                 endpoints,
                 models,
                 max_tokens_cap,
+                auth_header,
+                auth_prefix,
             } => Some(OpenAiProviderConfig {
                 api_url: api_url.clone(),
                 models_url: models_url.clone(),
                 endpoints: endpoints.clone(),
                 models: models.clone(),
                 max_tokens_cap: *max_tokens_cap,
+                auth_header: auth_header.clone(),
+                auth_prefix: auth_prefix.clone(),
             }),
             ProviderConfig::OpenRouter {
                 api_url,
@@ -309,12 +325,16 @@ impl ProviderConfig {
                 endpoints,
                 models,
                 max_tokens_cap,
+                auth_header,
+                auth_prefix,
             } => Some(OpenAiProviderConfig {
                 api_url: api_url.clone(),
                 models_url: models_url.clone(),
                 endpoints: endpoints.clone(),
                 models: models.clone(),
                 max_tokens_cap: *max_tokens_cap,
+                auth_header: auth_header.clone(),
+                auth_prefix: auth_prefix.clone(),
             }),
             _ => None,
         }
@@ -1095,6 +1115,8 @@ impl Config {
                 endpoints: HashMap::new(),
                 models: Vec::new(),
                 max_tokens_cap: None,
+                auth_header: None,
+                auth_prefix: None,
             },
         );
 
@@ -2136,6 +2158,8 @@ mod tests {
                         )]),
                         models: vec!["gpt-4.1".into(), "gpt-4.1-mini".into()],
                         max_tokens_cap: None,
+                        auth_header: None,
+                        auth_prefix: None,
                     },
                 ),
                 (
@@ -2146,6 +2170,8 @@ mod tests {
                         endpoints: HashMap::new(),
                         models: vec!["gpt-4.1".into()],
                         max_tokens_cap: None,
+                        auth_header: None,
+                        auth_prefix: None,
                     },
                 ),
             ]),
@@ -2600,6 +2626,8 @@ mod tests {
                 endpoints: HashMap::new(),
                 models: vec!["account-model".into(), "catalog-model".into()],
                 max_tokens_cap: None,
+                auth_header: None,
+                auth_prefix: None,
             },
         );
         cfg.routing.model_routes.insert(
@@ -2638,6 +2666,8 @@ mod tests {
                 endpoints: HashMap::new(),
                 models: vec!["account-model".into(), "other-model".into()],
                 max_tokens_cap: None,
+                auth_header: None,
+                auth_prefix: None,
             },
         );
         cfg.accounts.push(AccountConfig {
@@ -2666,6 +2696,8 @@ mod tests {
                 endpoints: HashMap::new(),
                 models: vec!["catalog-model".into()],
                 max_tokens_cap: None,
+                auth_header: None,
+                auth_prefix: None,
             },
         );
         cfg.accounts.push(AccountConfig {

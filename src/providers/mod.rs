@@ -1,7 +1,6 @@
 pub mod base;
 pub mod gemini;
 pub mod gemini_stream;
-pub mod gemini_utils;
 pub mod openai;
 pub mod openrouter;
 pub mod zai;

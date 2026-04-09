@@ -14,15 +14,16 @@ use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::warn;
 
+use fp_agent::normalize::normalize_responses_request;
+use fp_agent::validate::{validate_compact_request, validate_responses_request};
+
 use crate::access::{AuthenticatedKey, require_admin};
 use crate::config::{PersistedConfig, with_config, with_config_mut};
 use crate::error::ProxyError;
-use crate::normalizer;
 use crate::providers::base::ProviderExecutionContext;
 use crate::schema::openai::{ChatMessage, CompactRequest, ResponsesRequest};
 use crate::state::AppState;
 use crate::ui;
-use crate::validator;
 
 pub fn build_router(state: AppState) -> Router {
     initialize_runtime_state(&state);
@@ -478,7 +479,7 @@ async fn responses_handler(
     Json(data): Json<ResponsesRequest>,
 ) -> Result<Response<Body>, ProxyError> {
     let access_key = crate::access::authenticate_request(state.config(), &headers)?;
-    validator::validate_responses_request(&data)?;
+    validate_responses_request(&data).map_err(|err| ProxyError::Validation(err.to_string()))?;
     if !with_config(state.config(), |cfg| {
         cfg.is_served_model_allowed(&data.model)
     }) {
@@ -494,7 +495,7 @@ async fn responses_handler(
 
     let session_key = resolve_session_key(&state, &headers, &data)?;
     let cache_key_override = Some(session_key.cache_key_override());
-    let normalized = normalizer::normalize(data.clone());
+    let normalized = normalize_responses_request(&data);
     let route = resolve_response_route(
         &state,
         &data.model,
@@ -552,7 +553,7 @@ async fn responses_handler(
                 )
                 .await?;
                 current_request = compacted;
-                current_normalized = normalizer::normalize(current_request.clone());
+                current_normalized = normalize_responses_request(&current_request);
                 auto_compacted = true;
             }
         }
@@ -581,12 +582,12 @@ async fn compact_handler(
     Json(data): Json<CompactRequest>,
 ) -> Result<Response<Body>, ProxyError> {
     let access_key = crate::access::authenticate_request(state.config(), &headers)?;
-    validator::validate_compact_request(&data)?;
+    validate_compact_request(&data).map_err(|err| ProxyError::Validation(err.to_string()))?;
     let request_bytes = serde_json::to_vec(&data)
         .map(|v| v.len() as u64)
         .unwrap_or(0);
 
-    let normalized = normalizer::normalize(ResponsesRequest {
+    let normalized = normalize_responses_request(&ResponsesRequest {
         model: "__compaction__".to_string(),
         input: Some(data.input.clone()),
         messages: None,
@@ -1038,7 +1039,7 @@ async fn run_summary_compaction(
         stream: Some(false),
         include: None,
     };
-    let normalized = normalizer::normalize(raw.clone());
+    let normalized = normalize_responses_request(&raw);
     let resp = provider
         .handle_request(raw, normalized, HeaderMap::new(), context)
         .await?;
@@ -1147,6 +1148,8 @@ mod auto_compaction_tests {
                         endpoints: HashMap::new(),
                         models: vec!["real-routed-model".into()],
                         max_tokens_cap: None,
+                        auth_header: None,
+                        auth_prefix: None,
                     },
                 ),
                 (
@@ -1157,6 +1160,8 @@ mod auto_compaction_tests {
                         endpoints: HashMap::new(),
                         models: Vec::new(),
                         max_tokens_cap: None,
+                        auth_header: None,
+                        auth_prefix: None,
                     },
                 ),
             ]),
@@ -1408,7 +1413,7 @@ mod auto_compaction_tests {
             stream: Some(false),
             include: None,
         };
-        let normalized = normalizer::normalize(raw.clone());
+        let normalized = normalize_responses_request(&raw);
 
         assert!(target.model == "real-routed-model" || target.model == "unknown-upstream-model");
         assert_eq!(route.upstream_model, target.model);

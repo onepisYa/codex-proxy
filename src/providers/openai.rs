@@ -1,75 +1,33 @@
 use axum::body::Body;
 use axum::http::HeaderMap;
+use axum::http::header::{AUTHORIZATION, HeaderName};
 use axum::response::Response;
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+
+use fp_agent::providers::openai::{
+    OpenAiCompactPayload, OpenAiReasoning, OpenAiResponsesPayload, build_openai_compact_payload,
+    build_openai_payload,
+};
+use fp_agent::providers::tabcode::{build_tabcode_compact_payload, build_tabcode_payload};
 
 use crate::account_pool::AccountAuth;
 use crate::config::{EffectiveReasoningConfig, with_config};
 use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
-use crate::schema::openai::{
-    ChatRequest, CompactRequest, Instructions, ResponsesInput, ResponsesRequest, Tool,
-    input_items_to_text, messages_to_input_items,
-};
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct OpenAiReasoning {
-    pub(crate) effort: &'static str,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct OpenAiResponsesPayload {
-    model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input: Option<ResponsesInput>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    instructions: Option<Instructions>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    previous_response_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    store: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<std::collections::BTreeMap<String, serde_json::Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<Tool>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    include: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<OpenAiReasoning>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct OpenAiCompactPayload {
-    pub(crate) model: String,
-    pub(crate) input: ResponsesInput,
-    pub(crate) instructions: Instructions,
-    pub(crate) store: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) max_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) max_output_tokens: Option<u64>,
-    pub(crate) stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) reasoning: Option<OpenAiReasoning>,
-}
+use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
 
 pub struct OpenAiProvider {
     client: reqwest::Client,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelsResponse {
+    data: Vec<OpenAiModelItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelItem {
+    id: String,
 }
 
 impl Clone for OpenAiProvider {
@@ -130,12 +88,11 @@ impl OpenAiProvider {
         })
     }
 
-    async fn get_json_from(
+    fn apply_auth_header(
         &self,
-        endpoint_url: &str,
-        mut headers: HeaderMap,
+        headers: &mut HeaderMap,
         context: &ProviderExecutionContext,
-    ) -> Result<reqwest::Response, ProxyError> {
+    ) -> Result<(), ProxyError> {
         let api_key = match &context.account.auth {
             AccountAuth::ApiKey { api_key } => api_key,
             _ => {
@@ -145,14 +102,39 @@ impl OpenAiProvider {
             }
         };
 
-        headers.remove(axum::http::header::HOST);
-        headers.remove(axum::http::header::CONTENT_LENGTH);
+        let (auth_header, auth_prefix) = with_config(&context.config, |cfg| {
+            cfg.openai_provider_config(context.provider())
+                .ok()
+                .map(|cfg| (cfg.auth_header, cfg.auth_prefix))
+                .unwrap_or((None, None))
+        });
+
+        let header_name = auth_header.as_deref().unwrap_or("authorization").as_bytes();
+        let header_name = HeaderName::from_bytes(header_name)
+            .map_err(|e| ProxyError::Internal(format!("Invalid OpenAI auth header name: {e}")))?;
+
+        let prefix = auth_prefix.unwrap_or_else(|| "Bearer ".to_string());
+        let header_value = format!("{prefix}{api_key}");
+
+        headers.remove(AUTHORIZATION);
         headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Bearer {api_key}").parse().map_err(|e| {
+            header_name,
+            header_value.parse().map_err(|e| {
                 ProxyError::Internal(format!("Invalid OpenAI authorization header: {e}"))
             })?,
         );
+        Ok(())
+    }
+
+    async fn get_json_from(
+        &self,
+        endpoint_url: &str,
+        mut headers: HeaderMap,
+        context: &ProviderExecutionContext,
+    ) -> Result<reqwest::Response, ProxyError> {
+        headers.remove(axum::http::header::HOST);
+        headers.remove(axum::http::header::CONTENT_LENGTH);
+        self.apply_auth_header(&mut headers, context)?;
 
         self.client
             .get(endpoint_url)
@@ -173,23 +155,9 @@ impl OpenAiProvider {
         mut headers: HeaderMap,
         context: &ProviderExecutionContext,
     ) -> Result<reqwest::Response, ProxyError> {
-        let api_key = match &context.account.auth {
-            AccountAuth::ApiKey { api_key } => api_key,
-            _ => {
-                return Err(ProxyError::Auth(
-                    "OpenAI provider requires account auth.type=api_key".into(),
-                ));
-            }
-        };
-
         headers.remove(axum::http::header::HOST);
         headers.remove(axum::http::header::CONTENT_LENGTH);
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Bearer {api_key}").parse().map_err(|e| {
-                ProxyError::Internal(format!("Invalid OpenAI authorization header: {e}"))
-            })?,
-        );
+        self.apply_auth_header(&mut headers, context)?;
 
         self.client
             .post(endpoint_url)
@@ -307,7 +275,14 @@ impl Provider for OpenAiProvider {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
-        let mut payload = build_openai_payload(&raw_request, &context, None);
+        let reasoning = context.reasoning().map(|reasoning| OpenAiReasoning {
+            effort: reasoning_effort(reasoning),
+        });
+        let mut payload = if context.provider() == "tabcode" {
+            build_tabcode_payload(&raw_request, context.upstream_model(), reasoning, None)
+        } else {
+            build_openai_payload(&raw_request, context.upstream_model(), reasoning, None)
+        };
         clamp_payload_max_tokens(&mut payload, &context);
         Box::pin(async move { self.forward_json(&payload, headers, &context).await })
     }
@@ -320,18 +295,31 @@ impl Provider for OpenAiProvider {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
-        let mut payload = OpenAiCompactPayload {
-            model: context.upstream_model().to_string(),
-            input: data.input,
-            instructions: data.instructions,
-            store: false,
-            temperature: Some(with_config(&context.config, |cfg| cfg.compaction.temperature)),
-            max_tokens: Some(4096),
-            max_output_tokens: None,
-            stream: false,
-            reasoning: context
-                .reasoning()
-                .map(|reasoning| OpenAiReasoning { effort: reasoning_effort(reasoning) }),
+        let reasoning = context.reasoning().map(|reasoning| OpenAiReasoning {
+            effort: reasoning_effort(reasoning),
+        });
+        let mut payload = if context.provider() == "tabcode" {
+            build_tabcode_compact_payload(
+                &data,
+                context.upstream_model(),
+                reasoning,
+                Some(4096),
+                None,
+                Some(with_config(&context.config, |cfg| {
+                    cfg.compaction.temperature
+                })),
+            )
+        } else {
+            build_openai_compact_payload(
+                &data,
+                context.upstream_model(),
+                reasoning,
+                Some(4096),
+                None,
+                Some(with_config(&context.config, |cfg| {
+                    cfg.compaction.temperature
+                })),
+            )
         };
         clamp_compact_payload_max_tokens(&mut payload, &context);
         Box::pin(async move {
@@ -362,20 +350,9 @@ impl Provider for OpenAiProvider {
                 )));
             }
 
-            let parsed: Value =
+            let parsed: OpenAiModelsResponse =
                 serde_json::from_str(&body).map_err(|e| ProxyError::Provider(e.to_string()))?;
-            let data = parsed
-                .get("data")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| ProxyError::Provider("Upstream /models missing data[]".into()))?;
-
-            let mut out = Vec::new();
-            for item in data {
-                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                    out.push(id.to_string());
-                }
-            }
-            Ok(out)
+            Ok(parsed.data.into_iter().map(|item| item.id).collect())
         })
     }
 
@@ -384,58 +361,6 @@ impl Provider for OpenAiProvider {
             client: self.client.clone(),
         })
     }
-}
-
-pub(crate) fn build_openai_payload(
-    request: &ResponsesRequest,
-    context: &ProviderExecutionContext,
-    default_max_output_tokens: Option<u64>,
-) -> OpenAiResponsesPayload {
-    let input = resolve_input_for_payload(request);
-    let mut payload = OpenAiResponsesPayload {
-        model: context.upstream_model().to_string(),
-        input,
-        instructions: request.instructions.clone(),
-        previous_response_id: request.previous_response_id.clone(),
-        store: request.store,
-        metadata: request.metadata.clone(),
-        tools: request.tools.clone(),
-        tool_choice: request.tool_choice.clone(),
-        temperature: request.temperature,
-        top_p: request.top_p,
-        max_tokens: request.max_tokens,
-        max_output_tokens: request
-            .max_output_tokens
-            .or(request.max_tokens)
-            .or(default_max_output_tokens),
-        stream: request.stream,
-        include: request.include.clone(),
-        reasoning: context
-            .reasoning()
-            .map(|reasoning| OpenAiReasoning { effort: reasoning_effort(reasoning) }),
-    };
-    if payload.max_output_tokens.is_none() {
-        payload.max_output_tokens = payload.max_tokens;
-    }
-    payload
-}
-
-pub(crate) fn resolve_input_for_payload(request: &ResponsesRequest) -> Option<ResponsesInput> {
-    if let Some(input) = &request.input {
-        return Some(input.clone());
-    }
-    request
-        .messages
-        .as_ref()
-        .map(|messages| ResponsesInput::Items(messages_to_input_items(messages)))
-}
-
-pub(crate) fn coerce_items_input_to_text(payload: &mut OpenAiResponsesPayload) {
-    let Some(input) = payload.input.take() else { return };
-    payload.input = Some(match input {
-        ResponsesInput::Items(items) => ResponsesInput::Text(input_items_to_text(&items)),
-        other => other,
-    });
 }
 
 pub(crate) fn reasoning_effort(reasoning: &EffectiveReasoningConfig) -> &'static str {
@@ -500,6 +425,7 @@ mod tests {
         AccessControlConfig, CompactionConfig, ModelsConfig, ProviderConfig, ProvidersConfig,
         ReasoningConfig, RoutingConfig, RoutingHealthConfig, ServerConfig, TimeoutsConfig,
     };
+    use crate::schema::openai::ResponsesInput;
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -517,6 +443,8 @@ mod tests {
                 endpoints: HashMap::new(),
                 models: Vec::new(),
                 max_tokens_cap: None,
+                auth_header: None,
+                auth_prefix: None,
             },
         )]);
         let cfg = crate::config::Config {
@@ -600,16 +528,17 @@ mod tests {
             stream: None,
             include: None,
         };
+        let reasoning = EffectiveReasoningConfig {
+            budget: 16384,
+            level: "MEDIUM".into(),
+            preset: Some("medium".into()),
+        };
         let payload = build_openai_payload(
             &req,
-            &context(
-                Some(EffectiveReasoningConfig {
-                    budget: 16384,
-                    level: "MEDIUM".into(),
-                    preset: Some("medium".into()),
-                }),
-                None,
-            ),
+            "gpt-5",
+            Some(OpenAiReasoning {
+                effort: reasoning_effort(&reasoning),
+            }),
             None,
         );
         assert_eq!(payload.model, "gpt-5");
@@ -676,6 +605,8 @@ mod tests {
                 endpoints: HashMap::new(),
                 models: vec!["z-ai/glm-5-turbo".into()],
                 max_tokens_cap: Some(10_000),
+                auth_header: None,
+                auth_prefix: None,
             },
         )]);
 
@@ -740,7 +671,8 @@ mod tests {
             gemini_auth,
         };
 
-        let mut payload = build_openai_payload(&req, &context, None);
+        let model = context.route.upstream_model.clone();
+        let mut payload = build_openai_payload(&req, &model, None, None);
         clamp_payload_max_tokens(&mut payload, &context);
         assert_eq!(payload.max_tokens, Some(10_000));
         assert_eq!(payload.max_output_tokens, Some(10_000));
@@ -765,7 +697,7 @@ mod tests {
             stream: None,
             include: None,
         };
-        let payload = build_openai_payload(&req, &context(None, None), None);
+        let payload = build_openai_payload(&req, "gpt-4.1", None, None);
         assert_eq!(payload.max_output_tokens, Some(7));
     }
 }

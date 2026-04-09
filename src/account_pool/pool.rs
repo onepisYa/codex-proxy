@@ -310,10 +310,7 @@ impl AccountPool {
                 state.unhealthy_until = None;
                 debug!(
                     "Account {} ({}) recorded failure {}/{} but remains healthy",
-                    account.id,
-                    account.provider,
-                    state.consecutive_failures,
-                    threshold
+                    account.id, account.provider, state.consecutive_failures, threshold
                 );
             }
         }

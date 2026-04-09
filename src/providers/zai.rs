@@ -1,23 +1,20 @@
 use axum::body::Body;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 use crate::account_pool::AccountAuth;
-use crate::config::{EffectiveReasoningConfig, with_config};
+use crate::config::with_config;
 use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
-use crate::schema::common::from_chat_request;
-use crate::schema::openai::{
-
-    ChatContent, ChatMessage, ChatRequest, ResponsesRequest, Tool, ToolCall,
-};
+use crate::schema::openai::{ChatRequest, ResponsesRequest};
 use crate::schema::sse::{
     FunctionCallItem, LocalShellCallItem, MessageItem, OutputContentPart, OutputItem,
     ResponseObject, Usage,
 };
+use fp_agent::providers::zai::build_zai_chat_request;
 
 pub struct ZAIProvider {
     client: reqwest::Client,
@@ -73,8 +70,8 @@ impl ZAIProvider {
         context: &ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
         let auth = resolve_zai_auth(headers, context)?;
-        let common = from_chat_request(req);
-        let zai_req = to_zai_chat_request(req, &common, context.upstream_model(), context.reasoning());
+        let thinking_enabled = context.reasoning().map(|r| r.budget > 0);
+        let zai_req = build_zai_chat_request(req, context.upstream_model(), thinking_enabled);
         let resp = self.post_json(&zai_req, auth, context).await?;
         let status = resp.status();
         info!("Z.AI response status: {}", status);
@@ -161,44 +158,6 @@ impl Provider for ZAIProvider {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct ZaiChatRequest {
-    model: String,
-    messages: Vec<ZaiMessage>,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<Tool>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thinking: Option<ZaiThinkingConfig>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ZaiMessage {
-    role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<ToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ZaiThinkingConfig {
-    #[serde(rename = "type")]
-    thinking_type: String,
-}
-
 fn resolve_zai_auth(
     headers: HeaderMap,
     context: &ProviderExecutionContext,
@@ -224,85 +183,6 @@ fn resolve_zai_auth(
             "Missing Z.AI API key. Configure the account auth for this Z.AI account.".into(),
         )),
     }
-}
-
-fn to_zai_chat_request(
-    req: &ChatRequest,
-    _common: &fp_agent::AgentRequest,
-    model: &str,
-    reasoning: Option<&EffectiveReasoningConfig>,
-) -> ZaiChatRequest {
-    let tools = if req.tools.is_empty() {
-        None
-    } else {
-        Some(req.tools.iter().cloned().map(transform_tool).collect())
-    };
-    ZaiChatRequest {
-        model: model.to_string(),
-        messages: req.messages.iter().map(to_zai_message).collect(),
-        stream: req.stream,
-        tools,
-        tool_choice: req.tool_choice.clone(),
-        temperature: req.temperature,
-        top_p: req.top_p,
-        max_tokens: req.max_tokens,
-        thinking: reasoning.map(zai_thinking_config),
-    }
-}
-
-fn zai_thinking_config(reasoning: &EffectiveReasoningConfig) -> ZaiThinkingConfig {
-    ZaiThinkingConfig {
-        thinking_type: if reasoning.budget == 0 {
-            "disabled".into()
-        } else {
-            "enabled".into()
-        },
-    }
-}
-
-fn to_zai_message(msg: &ChatMessage) -> ZaiMessage {
-    let role = if msg.role == "developer" {
-        "system".to_string()
-    } else {
-        msg.role.clone()
-    };
-    let content = msg.content.as_ref().map(chat_content_to_string);
-    let tool_calls = if msg.tool_calls.is_empty() {
-        None
-    } else {
-        Some(msg.tool_calls.clone())
-    };
-    ZaiMessage {
-        role,
-        content,
-        tool_calls,
-        tool_call_id: msg.tool_call_id.clone(),
-        name: msg.name.clone(),
-    }
-}
-
-fn chat_content_to_string(c: &ChatContent) -> String {
-    match c {
-        ChatContent::Text(s) => s.clone(),
-        ChatContent::Parts(parts) => parts
-            .iter()
-            .map(|p| p.text.clone().unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join(""),
-    }
-}
-
-fn transform_tool(mut tool: Tool) -> Tool {
-    if tool.tool_type == "function" {
-        tool.strict = None;
-    }
-    if tool.tool_type == "web_search" {
-        tool.web_search = Some(crate::schema::openai::WebSearchConfig {
-            enable: Some(true),
-            search_engine: Some("search_pro_jina".into()),
-        });
-    }
-    tool
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -485,31 +365,4 @@ fn now_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn maps_reasoning_budget_to_zai_thinking_toggle() {
-        assert_eq!(
-            zai_thinking_config(&EffectiveReasoningConfig {
-                budget: 0,
-                level: "LOW".into(),
-                preset: Some("none".into()),
-            })
-            .thinking_type,
-            "disabled"
-        );
-        assert_eq!(
-            zai_thinking_config(&EffectiveReasoningConfig {
-                budget: 1024,
-                level: "LOW".into(),
-                preset: Some("minimal".into()),
-            })
-            .thinking_type,
-            "enabled"
-        );
-    }
 }

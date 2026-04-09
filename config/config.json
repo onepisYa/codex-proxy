@@ -30,7 +30,9 @@
       "type": "openai",
       "api_url": "https://api2.tabcode.cc/openai/v1/responses",
       "endpoints": {},
-      "models": []
+      "models": [],
+      "auth_header": "Authorization",
+      "auth_prefix": "Bearer "
     }
   },
   "models": {

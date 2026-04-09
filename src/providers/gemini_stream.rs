@@ -9,7 +9,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 use crate::schema::openai::ChatRequest;
-use serde_json::Value;
 use crate::schema::sse::{
     CreditsData, FailedResponseObject, FunctionCallItem, InputTokensDetails, MessageItem,
     OutputContentPart, OutputItem, OutputTokensDetails, RateLimitsData, ReasoningContentPart,
@@ -17,6 +16,7 @@ use crate::schema::sse::{
     ResponseFailedData, ResponseObject, ResponseOutputItemAddedData, ResponseOutputItemDoneData,
     ResponseOutputTextDeltaData, ServerReasoningIncludedData, SummaryPart, Usage,
 };
+use serde_json::Value;
 
 pub fn stream_responses_sse(
     byte_stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
