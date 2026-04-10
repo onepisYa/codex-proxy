@@ -2046,7 +2046,7 @@ fn join_windows_home(homedrive: Option<OsString>, homepath: Option<OsString>) ->
 }
 
 #[cfg(test)]
-mod tests {
+mod home_dir_tests {
     use super::resolve_home_dir;
     use std::ffi::OsString;
     use std::path::PathBuf;

@@ -1,15 +1,15 @@
 use axum::body::Body;
 use axum::http::HeaderMap;
-use axum::http::header::{AUTHORIZATION, HeaderName};
 use axum::http::StatusCode;
+use axum::http::header::{AUTHORIZATION, HeaderName};
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 
-use fp_agent::providers::openai::{
-    OpenAiCompactPayload, OpenAiReasoning, OpenAiResponsesPayload, build_openai_compact_payload,
-    build_openai_payload,
+use fp_agent::providers::adapter::{
+    ProviderBuildContext, ProviderKind, ProviderPayload, ProviderRequest, build_provider_payload,
 };
-use fp_agent::providers::tabcode::{build_tabcode_compact_payload, build_tabcode_payload};
+use fp_agent::providers::errors::parse_openai_error as parse_openai_error_details;
+use fp_agent::providers::openai::{OpenAiCompactPayload, OpenAiReasoning, OpenAiResponsesPayload};
 
 use crate::account_pool::AccountAuth;
 use crate::config::{EffectiveReasoningConfig, with_config};
@@ -29,35 +29,6 @@ struct OpenAiModelsResponse {
 #[derive(Debug, Deserialize)]
 struct OpenAiModelItem {
     id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiErrorResponse {
-    error: OpenAiErrorBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiErrorBody {
-    message: String,
-    #[serde(rename = "type")]
-    error_type: Option<String>,
-    code: Option<OpenAiErrorCode>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum OpenAiErrorCode {
-    String(String),
-    Number(i64),
-}
-
-impl OpenAiErrorCode {
-    fn to_string(&self) -> String {
-        match self {
-            OpenAiErrorCode::String(value) => value.clone(),
-            OpenAiErrorCode::Number(value) => value.to_string(),
-        }
-    }
 }
 
 impl Clone for OpenAiProvider {
@@ -232,7 +203,7 @@ impl OpenAiProvider {
         let bytes = response.bytes().await?;
 
         if !status.is_success() {
-            return Err(ProxyError::Provider(parse_openai_error(status, &bytes)));
+            return Err(ProxyError::Provider(map_openai_error(status, &bytes)));
         }
 
         let mut builder = Response::builder().status(status);
@@ -260,7 +231,7 @@ impl OpenAiProvider {
         let bytes = response.bytes().await?;
 
         if !status.is_success() {
-            return Err(ProxyError::Provider(parse_openai_error(status, &bytes)));
+            return Err(ProxyError::Provider(map_openai_error(status, &bytes)));
         }
 
         let mut builder = Response::builder().status(status);
@@ -289,10 +260,29 @@ impl Provider for OpenAiProvider {
         let reasoning = context.reasoning().map(|reasoning| OpenAiReasoning {
             effort: reasoning_effort(reasoning),
         });
-        let mut payload = if context.provider() == "tabcode" {
-            build_tabcode_payload(&raw_request, context.upstream_model(), reasoning, None)
+        let provider_kind = if context.provider() == "tabcode" {
+            ProviderKind::Tabcode
         } else {
-            build_openai_payload(&raw_request, context.upstream_model(), reasoning, None)
+            ProviderKind::OpenAi
+        };
+        let mut ctx = ProviderBuildContext::new(context.upstream_model());
+        ctx.reasoning = reasoning;
+        let payload = match build_provider_payload(
+            provider_kind,
+            ProviderRequest::Responses(&raw_request),
+            &ctx,
+        ) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return Box::pin(async move { Err(ProxyError::Internal(err.to_string())) });
+            }
+        };
+        let ProviderPayload::OpenAiResponses(mut payload) = payload else {
+            return Box::pin(async move {
+                Err(ProxyError::Internal(
+                    "OpenAI provider expects OpenAI-compatible payload".into(),
+                ))
+            });
         };
         clamp_payload_max_tokens(&mut payload, &context);
         Box::pin(async move { self.forward_json(&payload, headers, &context).await })
@@ -309,28 +299,30 @@ impl Provider for OpenAiProvider {
         let reasoning = context.reasoning().map(|reasoning| OpenAiReasoning {
             effort: reasoning_effort(reasoning),
         });
-        let mut payload = if context.provider() == "tabcode" {
-            build_tabcode_compact_payload(
-                &data,
-                context.upstream_model(),
-                reasoning,
-                Some(4096),
-                None,
-                Some(with_config(&context.config, |cfg| {
-                    cfg.compaction.temperature
-                })),
-            )
+        let provider_kind = if context.provider() == "tabcode" {
+            ProviderKind::Tabcode
         } else {
-            build_openai_compact_payload(
-                &data,
-                context.upstream_model(),
-                reasoning,
-                Some(4096),
-                None,
-                Some(with_config(&context.config, |cfg| {
-                    cfg.compaction.temperature
-                })),
-            )
+            ProviderKind::OpenAi
+        };
+        let mut ctx = ProviderBuildContext::new(context.upstream_model());
+        ctx.reasoning = reasoning;
+        ctx.compact_max_tokens = Some(4096);
+        ctx.compact_temperature = Some(with_config(&context.config, |cfg| {
+            cfg.compaction.temperature
+        }));
+        let payload =
+            match build_provider_payload(provider_kind, ProviderRequest::Compact(&data), &ctx) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    return Box::pin(async move { Err(ProxyError::Internal(err.to_string())) });
+                }
+            };
+        let ProviderPayload::OpenAiCompact(mut payload) = payload else {
+            return Box::pin(async move {
+                Err(ProxyError::Internal(
+                    "OpenAI provider expects OpenAI-compatible compact payload".into(),
+                ))
+            });
         };
         clamp_compact_payload_max_tokens(&mut payload, &context);
         Box::pin(async move {
@@ -357,13 +349,15 @@ impl Provider for OpenAiProvider {
             if !status.is_success() {
                 return Err(ProxyError::Provider(ProviderError::new(
                     Some(status),
-                    format!("Upstream models endpoint returned status {} body={}", status, body),
+                    format!(
+                        "Upstream models endpoint returned status {} body={}",
+                        status, body
+                    ),
                 )));
             }
 
-            let parsed: OpenAiModelsResponse = serde_json::from_str(&body).map_err(|e| {
-                ProxyError::Provider(ProviderError::new(None, e.to_string()))
-            })?;
+            let parsed: OpenAiModelsResponse = serde_json::from_str(&body)
+                .map_err(|e| ProxyError::Provider(ProviderError::new(None, e.to_string())))?;
             Ok(parsed.data.into_iter().map(|item| item.id).collect())
         })
     }
@@ -375,23 +369,13 @@ impl Provider for OpenAiProvider {
     }
 }
 
-fn parse_openai_error(status: reqwest::StatusCode, bytes: &[u8]) -> ProviderError {
-    let fallback_message = String::from_utf8_lossy(bytes).to_string();
-    let parsed: Result<OpenAiErrorResponse, _> = serde_json::from_slice(bytes);
-    if let Ok(parsed) = parsed {
-        let code = parsed.error.code.map(|value| value.to_string());
-        return ProviderError::with_details(
-            Some(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY)),
-            parsed.error.message,
-            code,
-            parsed.error.error_type,
-        );
-    }
+fn map_openai_error(status: reqwest::StatusCode, bytes: &[u8]) -> ProviderError {
+    let details = parse_openai_error_details(bytes);
     ProviderError::with_details(
         Some(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY)),
-        fallback_message,
-        None,
-        None,
+        details.message,
+        details.code,
+        details.error_type,
     )
 }
 
@@ -458,6 +442,7 @@ mod tests {
         ReasoningConfig, RoutingConfig, RoutingHealthConfig, ServerConfig, TimeoutsConfig,
     };
     use crate::schema::openai::ResponsesInput;
+    use fp_agent::providers::openai::build_openai_payload;
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::path::PathBuf;

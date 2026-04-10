@@ -14,7 +14,9 @@ use crate::schema::sse::{
     FunctionCallItem, LocalShellCallItem, MessageItem, OutputContentPart, OutputItem,
     ResponseObject, Usage,
 };
-use fp_agent::providers::zai::build_zai_chat_request;
+use fp_agent::providers::adapter::{
+    ProviderBuildContext, ProviderKind, ProviderPayload, ProviderRequest, build_provider_payload,
+};
 
 pub struct ZAIProvider {
     client: reqwest::Client,
@@ -70,8 +72,16 @@ impl ZAIProvider {
         context: &ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
         let auth = resolve_zai_auth(headers, context)?;
-        let thinking_enabled = context.reasoning().map(|r| r.budget > 0);
-        let zai_req = build_zai_chat_request(req, context.upstream_model(), thinking_enabled);
+        let mut ctx = ProviderBuildContext::new(context.upstream_model());
+        ctx.thinking_enabled = context.reasoning().map(|r| r.budget > 0);
+        let ProviderPayload::Zai(zai_req) =
+            build_provider_payload(ProviderKind::Zai, ProviderRequest::Chat(req), &ctx)
+                .map_err(|err| ProxyError::Internal(err.to_string()))?
+        else {
+            return Err(ProxyError::Internal(
+                "Z.AI provider expects Z.AI-compatible payload".into(),
+            ));
+        };
         let resp = self.post_json(&zai_req, auth, context).await?;
         let status = resp.status();
         info!("Z.AI response status: {}", status);

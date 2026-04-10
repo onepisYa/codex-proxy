@@ -89,7 +89,13 @@ impl fmt::Display for ProviderError {
             details.push(format!("type={error_type}"));
         }
         match (self.status, details.is_empty()) {
-            (Some(status), false) => write!(f, "{} (status={}, {})", self.message, status, details.join(", ")),
+            (Some(status), false) => write!(
+                f,
+                "{} (status={}, {})",
+                self.message,
+                status,
+                details.join(", ")
+            ),
             (Some(status), true) => write!(f, "{} (status={})", self.message, status),
             (None, false) => write!(f, "{} ({})", self.message, details.join(", ")),
             (None, true) => write!(f, "{}", self.message),

@@ -8,7 +8,10 @@ use crate::config::with_config;
 use crate::error::{ProviderError, ProxyError};
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::openai::{ChatRequest, ResponsesRequest};
-use fp_agent::providers::gemini::{GeminiInternalBody, build_gemini_request};
+use fp_agent::providers::adapter::{
+    ProviderBuildContext, ProviderKind, ProviderPayload, ProviderRequest, build_provider_payload,
+};
+use fp_agent::providers::gemini::GeminiInternalBody;
 
 pub struct GeminiProvider {
     client: reqwest::Client,
@@ -37,8 +40,16 @@ impl GeminiProvider {
             .get_auth_context(&context.account, false)
             .await?;
         let model = context.upstream_model();
-        let thinking_budget = context.reasoning().map(|rc| rc.budget);
-        let request_body = build_gemini_request(req_data, thinking_budget);
+        let mut ctx = ProviderBuildContext::new(model);
+        ctx.thinking_budget = context.reasoning().map(|rc| rc.budget);
+        let ProviderPayload::Gemini(request_body) =
+            build_provider_payload(ProviderKind::Gemini, ProviderRequest::Chat(req_data), &ctx)
+                .map_err(|err| ProxyError::Internal(err.to_string()))?
+        else {
+            return Err(ProxyError::Internal(
+                "Gemini provider expects Gemini-compatible payload".into(),
+            ));
+        };
 
         let provider_config = with_config(&context.config, |cfg| {
             cfg.gemini_provider_config(context.provider())

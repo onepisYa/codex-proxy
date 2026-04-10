@@ -6,8 +6,10 @@ use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
 
+use fp_agent::providers::adapter::{
+    ProviderBuildContext, ProviderKind, ProviderPayload, ProviderRequest, build_provider_payload,
+};
 use fp_agent::providers::openai::OpenAiReasoning;
-use fp_agent::providers::openrouter::{build_openrouter_compact_payload, build_openrouter_payload};
 
 use super::openai::{
     OpenAiProvider, clamp_compact_payload_max_tokens, clamp_payload_max_tokens, reasoning_effort,
@@ -43,14 +45,28 @@ impl Provider for OpenRouterProvider {
     > {
         let inner = self.inner.clone();
         let default_max_output_tokens = resolve_openrouter_default_max_output_tokens(&context);
-        let mut payload = build_openrouter_payload(
-            &raw_request,
-            context.upstream_model(),
-            context.reasoning().map(|reasoning| OpenAiReasoning {
-                effort: reasoning_effort(reasoning),
-            }),
-            default_max_output_tokens,
-        );
+        let mut ctx = ProviderBuildContext::new(context.upstream_model());
+        ctx.reasoning = context.reasoning().map(|reasoning| OpenAiReasoning {
+            effort: reasoning_effort(reasoning),
+        });
+        ctx.default_max_output_tokens = Some(default_max_output_tokens);
+        let payload = match build_provider_payload(
+            ProviderKind::OpenRouter,
+            ProviderRequest::Responses(&raw_request),
+            &ctx,
+        ) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return Box::pin(async move { Err(ProxyError::Internal(err.to_string())) });
+            }
+        };
+        let ProviderPayload::OpenAiResponses(mut payload) = payload else {
+            return Box::pin(async move {
+                Err(ProxyError::Internal(
+                    "OpenRouter provider expects OpenAI-compatible payload".into(),
+                ))
+            });
+        };
         clamp_payload_max_tokens(&mut payload, &context);
 
         Box::pin(async move { inner.forward_json(&payload, headers, &context).await })
@@ -66,16 +82,29 @@ impl Provider for OpenRouterProvider {
     > {
         let inner = self.inner.clone();
         let default_max_output_tokens = resolve_openrouter_default_max_output_tokens(&context);
-        let mut payload = build_openrouter_compact_payload(
-            &data,
-            context.upstream_model(),
-            context.reasoning().map(|reasoning| OpenAiReasoning {
-                effort: reasoning_effort(reasoning),
-            }),
-            Some(4096),
-            Some(default_max_output_tokens),
-            None,
-        );
+        let mut ctx = ProviderBuildContext::new(context.upstream_model());
+        ctx.reasoning = context.reasoning().map(|reasoning| OpenAiReasoning {
+            effort: reasoning_effort(reasoning),
+        });
+        ctx.compact_max_tokens = Some(4096);
+        ctx.compact_max_output_tokens = Some(default_max_output_tokens);
+        let payload = match build_provider_payload(
+            ProviderKind::OpenRouter,
+            ProviderRequest::Compact(&data),
+            &ctx,
+        ) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return Box::pin(async move { Err(ProxyError::Internal(err.to_string())) });
+            }
+        };
+        let ProviderPayload::OpenAiCompact(mut payload) = payload else {
+            return Box::pin(async move {
+                Err(ProxyError::Internal(
+                    "OpenRouter provider expects OpenAI-compatible compact payload".into(),
+                ))
+            });
+        };
         clamp_compact_payload_max_tokens(&mut payload, &context);
         Box::pin(async move { inner.forward_json(&payload, headers, &context).await })
     }
