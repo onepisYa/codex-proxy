@@ -12,16 +12,16 @@ use std::io;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::warn;
+use tracing::{debug, error, warn};
 
 use fp_agent::normalize::normalize_responses_request;
 use fp_agent::validate::{validate_compact_request, validate_responses_request};
 
 use crate::access::{AuthenticatedKey, require_admin};
-use crate::config::{PersistedConfig, with_config, with_config_mut};
+use crate::config::{PersistedConfig, ProviderType, with_config, with_config_mut};
 use crate::error::{ProviderError, ProviderErrorKind, ProxyError};
 use crate::providers::base::ProviderExecutionContext;
-use crate::schema::openai::{ChatMessage, CompactRequest, ResponsesRequest};
+use crate::schema::openai::{ChatMessage, CompactRequest, ResponsesInput, ResponsesRequest};
 use crate::state::AppState;
 use crate::ui;
 
@@ -85,7 +85,10 @@ fn start_recovery_probe_loop(state: &AppState) {
 
     let state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        // First probe runs immediately to minimize startup delay
+        run_recovery_probe_pass(&state).await;
+
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
             run_recovery_probe_pass(&state).await;
@@ -94,108 +97,162 @@ fn start_recovery_probe_loop(state: &AppState) {
 }
 
 async fn run_recovery_probe_pass(state: &AppState) {
-    for index in state.accounts().recovery_candidates() {
-        if !state.accounts().begin_recovery_probe(index) {
-            continue;
-        }
+    let candidates: Vec<usize> = state.accounts().recovery_candidates();
+    debug!("run_recovery_probe_pass: candidates_len={}", candidates.len());
 
+    // Phase 1: Collect all account data and targets FIRST, before claiming any probes.
+    // This prevents the bug where begin_recovery_probe succeeds but data collection fails,
+    // leaving the probe stuck in "in_progress" forever.
+    let mut probe_tasks: Vec<(
+        usize,
+        crate::account_pool::Account,
+        crate::account_pool::AccountSnapshot,
+        crate::config::RouteTargetConfig,
+    )> = Vec::new();
+    for index in candidates {
         let Some((account, snapshot)) = state.accounts().get_account(index) else {
-            state.accounts().finish_recovery_probe(index, false, None);
             continue;
         };
-
         let Some(target) = with_config(state.config(), |cfg| {
             cfg.recovery_probe_target(&account.provider)
         }) else {
-            state.accounts().finish_recovery_probe(index, false, None);
-            if !snapshot.alive {
-                warn!(
-                    "Recovery probe skipped for account index {} because provider '{}' has no configured probe target",
-                    index, account.provider
-                );
-            }
             continue;
         };
+        probe_tasks.push((index, account, snapshot, target));
+    }
 
-        let provider_name = account.provider.clone();
-        let account_id = account.id.clone();
-        let route = crate::account_pool::ResolvedRoute {
-            requested_model: target.model.clone(),
-            logical_model: target.model.clone(),
-            upstream_model: target.model.clone(),
-            endpoint: target.endpoint.clone(),
-            provider: provider_name.clone(),
-            account_index: index,
-            account_id: account.id.clone(),
-            cache_hit: false,
-            cache_key: 0,
-            preferred_target_index: 0,
-            reasoning: Some(crate::config::EffectiveReasoningConfig {
-                budget: 0,
-                level: "LOW".into(),
-                preset: Some("none".into()),
-            }),
-        };
-
-        let raw = ResponsesRequest {
-            model: target.model.clone(),
-            input: Some(crate::schema::openai::ResponsesInput::Text(
-                "health check".into(),
-            )),
-            messages: None,
-            instructions: None,
-            previous_response_id: None,
-            store: Some(false),
-            metadata: None,
-            tools: None,
-            tool_choice: None,
-            temperature: None,
-            top_p: None,
-            max_tokens: (provider_name == "openrouter").then_some(1),
-            max_output_tokens: None,
-            stream: Some(false),
-            include: None,
-        };
-        let normalized = crate::schema::openai::ChatRequest {
-            model: target.model.clone(),
-            messages: crate::schema::common::to_chat_messages(&[fp_agent::AgentMessage::user(
-                "health check".to_string(),
-            )]),
-            tools: Vec::new(),
-            tool_choice: Some("auto".to_string()),
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-            stream: false,
-            store: false,
-            metadata: Default::default(),
-            previous_response_id: None,
-            include: Vec::new(),
-        };
-        let provider = crate::providers::get_provider(state, &provider_name);
-        let context = ProviderExecutionContext {
-            route,
-            account,
-            config: state.config().clone(),
-            gemini_auth: state.gemini_auth(),
-        };
-        let result = provider
-            .handle_request(raw, normalized, HeaderMap::new(), context)
-            .await;
-        let (success, error_reason) = match result {
-            Ok(_) => (true, None),
-            Err(err) => {
-                let reason = format_proxy_error(&err);
-                warn!(
-                    "Recovery probe request failed for account {} ({}) reason={}",
-                    account_id, provider_name, reason
-                );
-                (false, Some(reason))
+    // Phase 2: Claim probes and spawn tasks - only for candidates that successfully
+    // passed Phase 1. This ensures we never claim a probe without being able to run it.
+    let handles: Vec<_> = probe_tasks
+        .into_iter()
+        .filter_map(|(index, account, snapshot, target)| {
+            if !state.accounts().begin_recovery_probe(index) {
+                return None;
             }
-        };
-        state
-            .accounts()
-            .finish_recovery_probe(index, success, error_reason.as_deref());
+            let state_clone = state.clone();
+            let index_clone = index;
+            Some(tokio::spawn(async move {
+                let result = execute_probe_for_account(
+                    &state_clone,
+                    index_clone,
+                    &account,
+                    &snapshot,
+                    &target,
+                )
+                .await;
+                (index_clone, result)
+            }))
+        })
+        .collect();
+
+    // Phase 3: Wait for all probes to complete
+    debug!("Phase 3: waiting for {} handles", handles.len());
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let mut unordered: FuturesUnordered<_> = handles.into_iter().collect();
+    while let Some(result) = unordered.next().await {
+        match result {
+            Ok((index, result)) => {
+                debug!(
+                    "Probe completed: index={} success={} error={:?}",
+                    index, result.0, result.1
+                );
+                state
+                    .accounts()
+                    .finish_recovery_probe(index, result.0, result.1.as_deref());
+            }
+            Err(panic_err) => {
+                error!("Probe task panicked: {}", panic_err);
+            }
+        }
+    }
+}
+
+async fn execute_probe_for_account(
+    state: &AppState,
+    index: usize,
+    account: &crate::account_pool::Account,
+    _snapshot: &crate::account_pool::AccountSnapshot,
+    target: &crate::config::RouteTargetConfig,
+) -> (bool, Option<String>) {
+    debug!("execute_probe_for_account START: index={} provider={}", index, account.provider);
+    let provider_name = account.provider.clone();
+    let account_id = account.id.clone();
+
+    let route = crate::account_pool::ResolvedRoute {
+        requested_model: target.model.clone(),
+        logical_model: target.model.clone(),
+        upstream_model: target.model.clone(),
+        endpoint: target.endpoint.clone(),
+        provider: provider_name.clone(),
+        account_index: index,
+        account_id: account.id.clone(),
+        cache_hit: false,
+        cache_key: 0,
+        preferred_target_index: 0,
+        reasoning: Some(crate::config::EffectiveReasoningConfig {
+            budget: 0,
+            level: "LOW".into(),
+            preset: Some("none".into()),
+        }),
+    };
+
+    let raw = ResponsesRequest {
+        model: target.model.clone(),
+        input: Some(crate::schema::openai::ResponsesInput::Text(
+            "health check".into(),
+        )),
+        messages: None,
+        instructions: None,
+        previous_response_id: None,
+        store: Some(false),
+        metadata: None,
+        tools: None,
+        tool_choice: None,
+        temperature: None,
+        top_p: None,
+        max_tokens: (provider_name == "openrouter").then_some(1),
+        max_output_tokens: None,
+        stream: Some(false),
+        include: None,
+    };
+    let normalized = crate::schema::openai::ChatRequest {
+        model: target.model.clone(),
+        messages: crate::schema::common::to_chat_messages(&[fp_agent::AgentMessage::user(
+            "health check".to_string(),
+        )]),
+        tools: Vec::new(),
+        tool_choice: Some("auto".to_string()),
+        temperature: None,
+        top_p: None,
+        max_tokens: None,
+        stream: false,
+        store: false,
+        metadata: Default::default(),
+        previous_response_id: None,
+        include: Vec::new(),
+    };
+    let provider = crate::providers::get_provider(state, &provider_name);
+    let context = ProviderExecutionContext {
+        route,
+        account: account.clone(),
+        config: state.config().clone(),
+        gemini_auth: state.gemini_auth(),
+    };
+
+    let result = provider
+        .handle_request(raw, normalized, HeaderMap::new(), context)
+        .await;
+    debug!("execute_probe_for_account END: index={} provider={} result={:?}", index, provider_name, result);
+    match result {
+        Ok(_) => (true, None),
+        Err(err) => {
+            let reason = format_proxy_error(&err);
+            warn!(
+                "Recovery probe request failed for account {} ({}) reason={}",
+                account_id, provider_name, reason
+            );
+            (false, Some(reason))
+        }
     }
 }
 
@@ -478,6 +535,23 @@ async fn responses_handler(
     headers: HeaderMap,
     Json(data): Json<ResponsesRequest>,
 ) -> Result<Response<Body>, ProxyError> {
+    // Debug: log raw request input
+    tracing::debug!("responses_handler raw request: input={:?}", data.input);
+    tracing::debug!("responses_handler raw request: messages={:?}", data.messages);
+    if let Some(ref input) = data.input {
+        match input {
+            ResponsesInput::Items(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    tracing::debug!("responses_handler input item[{}]: type={} id={:?} call_id={:?} name={:?} arguments={:?}",
+                        i, item.item_type, item.id, item.call_id, item.name, item.arguments);
+                }
+            }
+            ResponsesInput::Text(text) => {
+                tracing::debug!("responses_handler input is Text: {}", text);
+            }
+        }
+    }
+
     let access_key = crate::access::authenticate_request(state.config(), &headers)?;
     validate_responses_request(&data).map_err(|err| ProxyError::Validation(err.to_string()))?;
     if !with_config(state.config(), |cfg| {
@@ -496,12 +570,28 @@ async fn responses_handler(
     let session_key = resolve_session_key(&state, &headers, &data)?;
     let cache_key_override = Some(session_key.cache_key_override());
     let normalized = normalize_responses_request(&data);
+    tracing::debug!("responses_handler: normalized stream={}", normalized.stream);
+    // Debug: log tool_calls in normalized messages
+    for (i, msg) in normalized.messages.iter().enumerate() {
+        if !msg.tool_calls.is_empty() {
+            tracing::debug!("responses_handler: normalized message[{}] role={} has {} tool_calls", i, msg.role, msg.tool_calls.len());
+            for (j, tc) in msg.tool_calls.iter().enumerate() {
+                tracing::debug!("responses_handler: tool_call[{}] id={} name={} args={}", j, tc.id, tc.function.name, tc.function.arguments);
+            }
+        }
+    }
     let route = resolve_response_route(
         &state,
         &data.model,
         &normalized.messages,
         cache_key_override,
     )?;
+    tracing::debug!(
+        "Routing resolved: provider={}, model={}, account={}",
+        route.provider,
+        route.upstream_model,
+        route.account_id
+    );
     let provider = crate::providers::get_provider(&state, &route.provider);
     let (account, _) = state
         .accounts()
@@ -522,6 +612,7 @@ async fn responses_handler(
     let mut current_request = data.clone();
     let mut current_normalized = normalized;
     let mut auto_compacted = false;
+    tracing::debug!("Calling provider.handle_request for attempt {}", attempt);
     let final_result = loop {
         let result = provider
             .handle_request(
@@ -533,8 +624,12 @@ async fn responses_handler(
             .await;
 
         match result {
-            Ok(resp) => break Ok(resp),
+            Ok(resp) => {
+                tracing::debug!("Provider returned success, status={}", resp.status());
+                break Ok(resp);
+            }
             Err(err) => {
+                tracing::debug!("Provider error: {}", err);
                 if !auto_cfg.enabled
                     || attempt >= auto_cfg.max_attempts_per_request
                     || !is_context_length_error(&err)
@@ -561,6 +656,7 @@ async fn responses_handler(
 
     let final_result = match final_result {
         Ok(resp) => {
+            tracing::debug!("Provider succeeded, finalizing response");
             let mut resp = finalize_response(&state, resp, &session_key).await;
             if auto_compacted {
                 resp.headers_mut().insert(
@@ -570,7 +666,10 @@ async fn responses_handler(
             }
             Ok(resp)
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            tracing::debug!("Provider failed, returning error directly");
+            Err(err)
+        }
     };
 
     record_and_apply_result(&state, &access_key, &context, request_bytes, final_result)
@@ -607,7 +706,7 @@ async fn compact_handler(
     let route = resolve_compaction_route(&state, &normalized.messages, None)?;
     let provider_type = with_config(state.config(), |cfg| cfg.provider_type(&route.provider))
         .map_err(ProxyError::Config)?;
-    if !provider_type.is_openai_compatible() {
+    if !provider_type.is_openai_compatible() && provider_type != ProviderType::Minimax {
         return Err(ProxyError::NotImplemented(format!(
             "Compaction is only supported for OpenAI-compatible providers; resolved provider '{}' does not support native compaction",
             route.provider

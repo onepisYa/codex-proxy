@@ -53,7 +53,7 @@ impl ZAIProvider {
     ) -> Result<reqwest::Response, ProxyError> {
         let endpoint_url = self.resolve_endpoint_url(context)?;
         self.client
-            .post(endpoint_url)
+            .post(&endpoint_url)
             .header("Authorization", auth)
             .json(payload)
             .timeout(std::time::Duration::from_secs(with_config(

@@ -1,6 +1,9 @@
 pub mod base;
 pub mod gemini;
 pub mod gemini_stream;
+pub mod minimax;
+pub mod minimax_stream;
+pub mod minimax_wire;
 pub mod openai;
 pub mod openrouter;
 pub mod zai;
@@ -12,6 +15,7 @@ use crate::config::{ProviderType, with_config};
 use crate::state::AppState;
 use base::Provider;
 use gemini::GeminiProvider;
+use minimax::MinimaxProvider;
 use openai::OpenAiProvider;
 use openrouter::OpenRouterProvider;
 use zai::ZAIProvider;
@@ -30,6 +34,7 @@ impl ProviderRegistry {
             ProviderType::OpenRouter,
             Box::new(OpenRouterProvider::new()),
         );
+        providers.insert(ProviderType::Minimax, Box::new(MinimaxProvider::default()));
         Self { providers }
     }
 
@@ -42,6 +47,7 @@ impl ProviderRegistry {
             ProviderType::Zai => Box::new(ZAIProvider::new()),
             ProviderType::OpenAi => Box::new(OpenAiProvider::new()),
             ProviderType::OpenRouter => Box::new(OpenRouterProvider::new()),
+            ProviderType::Minimax => Box::new(MinimaxProvider::default()),
         }
     }
 }

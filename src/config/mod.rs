@@ -134,6 +134,7 @@ pub enum ProviderType {
     OpenRouter,
     #[serde(rename = "openai", alias = "open_ai")]
     OpenAi,
+    Minimax,
 }
 
 impl std::fmt::Display for ProviderType {
@@ -143,6 +144,7 @@ impl std::fmt::Display for ProviderType {
             ProviderType::Zai => "zai",
             ProviderType::OpenRouter => "openrouter",
             ProviderType::OpenAi => "openai",
+            ProviderType::Minimax => "minimax",
         })
     }
 }
@@ -170,6 +172,15 @@ pub struct ZaiProviderConfig {
     pub endpoints: HashMap<String, String>,
     #[serde(default)]
     pub allow_authorization_passthrough: bool,
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MinimaxProviderConfig {
+    pub api_url: String,
+    #[serde(default)]
+    pub endpoints: HashMap<String, String>,
     #[serde(default)]
     pub models: Vec<String>,
 }
@@ -243,6 +254,13 @@ pub enum ProviderConfig {
         #[serde(default)]
         auth_prefix: Option<String>,
     },
+    Minimax {
+        api_url: String,
+        #[serde(default)]
+        endpoints: HashMap<String, String>,
+        #[serde(default)]
+        models: Vec<String>,
+    },
 }
 
 impl ProviderConfig {
@@ -252,6 +270,7 @@ impl ProviderConfig {
             ProviderConfig::Zai { .. } => ProviderType::Zai,
             ProviderConfig::OpenAi { .. } => ProviderType::OpenAi,
             ProviderConfig::OpenRouter { .. } => ProviderType::OpenRouter,
+            ProviderConfig::Minimax { .. } => ProviderType::Minimax,
         }
     }
 
@@ -260,7 +279,8 @@ impl ProviderConfig {
             ProviderConfig::Gemini { models, .. }
             | ProviderConfig::Zai { models, .. }
             | ProviderConfig::OpenAi { models, .. }
-            | ProviderConfig::OpenRouter { models, .. } => models,
+            | ProviderConfig::OpenRouter { models, .. }
+            | ProviderConfig::Minimax { models, .. } => models,
         }
     }
 
@@ -294,6 +314,21 @@ impl ProviderConfig {
                 api_url: api_url.clone(),
                 endpoints: endpoints.clone(),
                 allow_authorization_passthrough: *allow_authorization_passthrough,
+                models: models.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn as_minimax(&self) -> Option<MinimaxProviderConfig> {
+        match self {
+            ProviderConfig::Minimax {
+                api_url,
+                endpoints,
+                models,
+            } => Some(MinimaxProviderConfig {
+                api_url: api_url.clone(),
+                endpoints: endpoints.clone(),
                 models: models.clone(),
             }),
             _ => None,
@@ -360,6 +395,9 @@ impl ProviderConfig {
                 api_url, endpoints, ..
             }
             | ProviderConfig::Zai {
+                api_url, endpoints, ..
+            }
+            | ProviderConfig::Minimax {
                 api_url, endpoints, ..
             } => match endpoint {
                 Some(name) => endpoints.get(name).cloned().ok_or_else(|| {
@@ -457,6 +495,17 @@ impl ProviderConfig {
                 }
                 if let Some(url) = models_url {
                     validate_url(url, &format!("Provider '{}' models_url", provider_name))?;
+                }
+            }
+            ProviderConfig::Minimax {
+                api_url, endpoints, ..
+            } => {
+                validate_url(api_url, &format!("Provider '{}' api_url", provider_name))?;
+                for (name, url) in endpoints {
+                    validate_url(
+                        url,
+                        &format!("Provider '{}' endpoint '{}'", provider_name, name),
+                    )?;
                 }
             }
         }
@@ -1474,7 +1523,10 @@ impl Config {
                     }
                 }
                 (
-                    ProviderType::Zai | ProviderType::OpenAi | ProviderType::OpenRouter,
+                    ProviderType::Zai
+                    | ProviderType::OpenAi
+                    | ProviderType::OpenRouter
+                    | ProviderType::Minimax,
                     AccountAuth::ApiKey { api_key },
                 ) => {
                     if api_key.is_empty() {
