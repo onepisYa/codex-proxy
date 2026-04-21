@@ -187,6 +187,10 @@ impl AccountPool {
         if let Some((account, state)) = guard.get(index) {
             let mut state = state.write();
             state.probe_in_progress.store(false, Ordering::Release);
+            debug!(
+                "finish_recovery_probe: account={} ({}) success={} error={:?}",
+                account.id, account.provider, success, error
+            );
             if success {
                 state.alive = true;
                 state.consecutive_failures = 0;

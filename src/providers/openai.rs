@@ -448,6 +448,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    #[allow(dead_code)]
     fn context(
         reasoning: Option<EffectiveReasoningConfig>,
         endpoint: Option<&str>,

@@ -157,11 +157,14 @@ impl Router {
         cache_key_override: Option<u64>,
     ) -> Option<RoutingDecision> {
         if candidates.is_empty() {
+            debug!("Routing failed: no candidates provided");
             return None;
         }
 
         let cache_key =
             cache_key_override.unwrap_or_else(|| compute_cache_key(&message_signature(messages)));
+
+        debug!("Routing: cache_key={}, candidates_len={}", cache_key, candidates.len());
 
         if let Some(binding) = state.sticky_bindings.read().get(&cache_key).cloned() {
             for candidate in candidates {
@@ -201,8 +204,18 @@ impl Router {
                     reasoning: None,
                 });
             if candidate_indices.is_empty() {
+                debug!(
+                    "No healthy accounts for candidate: provider={}, model={}, endpoint={:?}",
+                    candidate.provider, candidate.upstream_model, candidate.endpoint
+                );
                 continue;
             }
+            debug!(
+                "Found {} healthy account(s) for candidate: provider={}, model={}",
+                candidate_indices.len(),
+                candidate.provider,
+                candidate.upstream_model
+            );
 
             let mut sorted_indices = candidate_indices;
             sorted_indices.sort_by_key(|idx| {
@@ -241,6 +254,11 @@ impl Router {
     ) -> Result<ResolvedRoute, ProxyError> {
         let decision = Self::route(pool, state, candidates, messages, cache_key_override)
             .ok_or_else(|| {
+                tracing::warn!(
+                    "Routing failed: no healthy accounts available. candidates_len={}, messages_len={}",
+                    candidates.len(),
+                    messages.len()
+                );
                 ProxyError::Provider(ProviderError::new(
                     None,
                     "No compatible healthy accounts available for any preferred target",

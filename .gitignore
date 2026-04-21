@@ -220,3 +220,4 @@ secrets.json
 
 # Local config overlays (secrets)
 *.local
+.DS_Store
