@@ -536,64 +536,6 @@ fn translate_tools(tools: &[Tool]) -> Vec<AnthropicTool> {
                 return vec![].into_iter();
             }
 
-            // Handle namespace container - flatten to qualified names
-            // Codex sends namespace containers to support deferred loading of MCP tools
-            // e.g. mcp__codex_apps__calendar + "__" + create_event
-            if tool.tool_type == "namespace" {
-                if let Some(inner_tools) = &tool.tools {
-                    let parent_prefix = tool.name.as_deref().unwrap_or("");
-                    return inner_tools
-                        .iter()
-                        .filter_map(|inner| {
-                            if inner.tool_type != "function" {
-                                return None;
-                            }
-                            // Extract name: function.name > tool.name > ""
-                            let inner_name = inner
-                                .function
-                                .as_ref()
-                                .map(|f| f.name.clone())
-                                .or_else(|| inner.name.clone())
-                                .unwrap_or_default();
-                            let qualified_name = if parent_prefix.is_empty() {
-                                inner_name
-                            } else if parent_prefix.ends_with("__") {
-                                format!("{}{}", parent_prefix, inner_name)
-                            } else {
-                                format!("{}__{}", parent_prefix, inner_name)
-                            };
-
-                            // Anthropic tool name limit: 64 chars
-                            if qualified_name.len() > 64 {
-                                tracing::warn!(
-                                    "tool name exceeds 64-char limit ({}): '{}'. Consider shortening MCP server/tool names in Codex client.",
-                                    qualified_name.len(),
-                                    qualified_name
-                                );
-                                return None;
-                            }
-
-                            Some(AnthropicTool {
-                                name: qualified_name,
-                                description: inner
-                                    .function
-                                    .as_ref()
-                                    .and_then(|f| f.description.clone())
-                                    .or(inner.description.clone()),
-                                input_schema: inner
-                                    .function
-                                    .as_ref()
-                                    .and_then(|f| f.parameters.clone())
-                                    .or_else(|| inner.parameters.clone())
-                                    .unwrap_or(serde_json::json!({})),
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                        .into_iter();
-                }
-                return vec![].into_iter();
-            }
-
             // Extract function info
             let (name, description, input_schema) = match &tool.function {
                 Some(func) => (
