@@ -301,6 +301,7 @@ fn map_zai_response_to_responses_api(z: &ZaiChatResponse) -> ResponseObject {
                     arguments: args,
                     call_id: call_id.clone(),
                     thought_signature: None,
+                    namespace: None,
                 })
             };
             output.push(item);

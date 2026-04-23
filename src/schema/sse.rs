@@ -165,6 +165,8 @@ pub struct ReasoningItem {
     pub status: String,
     pub summary: Vec<SummaryPart>,
     pub content: Vec<ReasoningContentPart>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -176,6 +178,8 @@ pub struct FunctionCallItem {
     pub call_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

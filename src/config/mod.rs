@@ -183,6 +183,7 @@ pub struct MinimaxProviderConfig {
     pub endpoints: HashMap<String, String>,
     #[serde(default)]
     pub models: Vec<String>,
+    pub default_max_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +261,8 @@ pub enum ProviderConfig {
         endpoints: HashMap<String, String>,
         #[serde(default)]
         models: Vec<String>,
+        #[serde(default)]
+        default_max_tokens: Option<u64>,
     },
 }
 
@@ -326,10 +329,12 @@ impl ProviderConfig {
                 api_url,
                 endpoints,
                 models,
+                default_max_tokens,
             } => Some(MinimaxProviderConfig {
                 api_url: api_url.clone(),
                 endpoints: endpoints.clone(),
                 models: models.clone(),
+                default_max_tokens: default_max_tokens.unwrap_or(8192),
             }),
             _ => None,
         }
@@ -1962,6 +1967,21 @@ impl Config {
             .ok_or_else(|| {
                 ConfigError::InvalidValue(format!(
                     "Provider '{}' is not configured as type openai",
+                    provider
+                ))
+            })
+    }
+
+    pub fn minimax_provider_config(
+        &self,
+        provider: &str,
+    ) -> Result<MinimaxProviderConfig, ConfigError> {
+        self.providers
+            .get(provider)
+            .and_then(ProviderConfig::as_minimax)
+            .ok_or_else(|| {
+                ConfigError::InvalidValue(format!(
+                    "Provider '{}' is not configured as type minimax",
                     provider
                 ))
             })

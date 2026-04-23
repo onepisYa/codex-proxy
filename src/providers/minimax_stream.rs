@@ -3,12 +3,12 @@ use futures::StreamExt;
 use futures::stream::Stream;
 use serde::Deserialize;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
-use crate::providers::minimax_wire::store_call_id_mapping;
+use crate::providers::minimax_session::TranslationSession;
 use crate::schema::openai::ChatRequest;
 use crate::schema::sse::{
     FailedResponseObject, FunctionCallItem, MessageItem, OutputContentPart, OutputItem,
@@ -31,6 +31,7 @@ pub fn stream_responses_sse(
     created_ts: i64,
     request: &ChatRequest,
     idle_timeout_seconds: u64,
+    session: TranslationSession,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     let model = model.to_string();
     let resp_id = format!("resp_{created_ts}");
@@ -42,9 +43,10 @@ pub fn stream_responses_sse(
         let mut stream_state = StreamState {
             resp_id: resp_id.clone(),
             final_usage: None,
-            blocks: HashMap::new(),
+            blocks: BTreeMap::new(),
             next_output_index: 0,
             closed_items: Vec::new(),
+            session,
         };
 
         debug!("SSE STREAM: emitting response.created");
@@ -211,11 +213,13 @@ pub fn stream_responses_sse(
 struct StreamState {
     resp_id: String,
     final_usage: Option<Usage>,
-    blocks: HashMap<usize, BlockState>,
+    blocks: BTreeMap<usize, BlockState>,
     next_output_index: usize,
     closed_items: Vec<OutputItem>,
+    session: TranslationSession,
 }
 
+#[derive(Clone)]
 enum BlockState {
     Message {
         output_index: usize,
@@ -281,14 +285,21 @@ impl StreamState {
                 self.next_output_index += 1;
                 let item_id = format!("fc_{}_{}", now_ms(), output_index);
                 // Use MiniMax's original tool_use.id as call_id for our FunctionCallItem
-                let call_id = block_start.content_block.id.clone()
+                let call_id = block_start
+                    .content_block
+                    .id
+                    .clone()
                     .unwrap_or_else(|| format!("call_{}", now_ms()));
 
-                tracing::debug!("MiniMax tool_use id from SSE: {:?}, using call_id: {:?}", block_start.content_block.id, call_id);
+                tracing::debug!(
+                    "MiniMax tool_use id from SSE: {:?}, using call_id: {:?}",
+                    block_start.content_block.id,
+                    call_id
+                );
 
                 // Store the mapping: MiniMax's call_id -> our tool_use.id (by position)
                 // This allows us to look up our original ID when processing function_call_output
-                store_call_id_mapping(&call_id);
+                self.session.store_minimax_call_id(&call_id);
 
                 let name = block_start.content_block.name.clone().unwrap_or_default();
 
@@ -320,6 +331,7 @@ impl StreamState {
                         })
                         .unwrap_or_default(),
                     thought_signature: None,
+                    namespace: None,
                 });
 
                 Some(make_output_item_added(
@@ -348,6 +360,7 @@ impl StreamState {
                     status: "in_progress".into(),
                     summary: Vec::new(),
                     content: Vec::new(),
+                    thought_signature: None,
                 });
 
                 Some(make_output_item_added(
@@ -422,8 +435,8 @@ impl StreamState {
                         ));
                     }
                     if let Some(sig_delta) = &d.signature_delta {
-                        // Signature delta for reasoning - accumulate but don't emit separate event
-                        content_text.push_str(sig_delta);
+                        // Store signature delta in session for multi-turn roundtrip
+                        self.session.store_thinking_signature(item_id, sig_delta);
                     }
                 }
             }
@@ -482,7 +495,9 @@ impl StreamState {
     }
 
     fn finalize_all(&mut self, seq_num: &mut u64) -> Vec<Bytes> {
-        let remaining: Vec<(usize, BlockState)> = self.blocks.drain().collect();
+        let remaining: Vec<(usize, BlockState)> =
+            self.blocks.iter().map(|(k, v)| (*k, v.clone())).collect();
+        self.blocks.clear();
         remaining
             .into_iter()
             .map(|(_idx, state)| {
@@ -518,27 +533,35 @@ impl StreamState {
                 } else {
                     call_id
                 };
+                let (namespace, inner_name) =
+                    crate::providers::minimax_wire::extract_namespace(&name);
                 OutputItem::FunctionCall(FunctionCallItem {
                     id: item_id,
                     status: "completed".into(),
-                    name,
+                    name: inner_name,
                     arguments: args,
                     call_id: final_call_id,
                     thought_signature: None,
+                    namespace,
                 })
             }
             BlockState::Reasoning {
                 item_id,
                 content_text,
                 ..
-            } => OutputItem::Reasoning(ReasoningItem {
-                id: item_id,
-                status: "completed".into(),
-                summary: Vec::new(),
-                content: vec![crate::schema::sse::ReasoningContentPart::ReasoningText {
-                    text: content_text,
-                }],
-            }),
+            } => {
+                // Look up thinking signature from session for multi-turn roundtrip
+                let thought_signature = self.session.lookup_thinking_signature(&item_id);
+                OutputItem::Reasoning(ReasoningItem {
+                    id: item_id,
+                    status: "completed".into(),
+                    summary: Vec::new(),
+                    content: vec![crate::schema::sse::ReasoningContentPart::ReasoningText {
+                        text: content_text,
+                    }],
+                    thought_signature,
+                })
+            }
         }
     }
 }
@@ -606,7 +629,7 @@ fn make_reasoning_delta(
 ) -> Bytes {
     encode_event(
         seq_num,
-        "response.output_text.delta",
+        "response.reasoning_text.delta",
         ResponseOutputTextDeltaData {
             response_id: resp_id.to_string(),
             item_id: item_id.to_string(),
@@ -683,7 +706,12 @@ pub struct ContentBlockDeltaChunk {
 pub struct ContentBlockDeltaFields {
     #[serde(default, rename = "text")]
     pub text_delta: Option<String>,
-    #[serde(default, rename = "input_json_delta", alias = "input_json", alias = "partial_json")]
+    #[serde(
+        default,
+        rename = "input_json_delta",
+        alias = "input_json",
+        alias = "partial_json"
+    )]
     pub input_json_delta: Option<String>,
     #[serde(default)]
     pub thinking_delta: Option<String>,
@@ -953,7 +981,14 @@ mod tests {
         let model = "test-model";
         let request = make_test_request();
 
-        let result_stream = stream_responses_sse(stream, model, created_ts, &request, 60);
+        let result_stream = stream_responses_sse(
+            stream,
+            model,
+            created_ts,
+            &request,
+            60,
+            TranslationSession::new(),
+        );
         let events: Vec<_> = result_stream.collect().await;
 
         eprintln!("TOTAL_EVENTS: {}", events.len());
@@ -1036,7 +1071,14 @@ mod tests {
         let model = "test-model";
         let request = make_test_request();
 
-        let result_stream = stream_responses_sse(stream, model, created_ts, &request, 60);
+        let result_stream = stream_responses_sse(
+            stream,
+            model,
+            created_ts,
+            &request,
+            60,
+            TranslationSession::new(),
+        );
         let events: Vec<_> = result_stream.collect().await;
 
         let event_types = collect_event_types(events);
@@ -1091,7 +1133,14 @@ mod tests {
         let model = "test-model";
         let request = make_test_request();
 
-        let result_stream = stream_responses_sse(stream, model, created_ts, &request, 60);
+        let result_stream = stream_responses_sse(
+            stream,
+            model,
+            created_ts,
+            &request,
+            60,
+            TranslationSession::new(),
+        );
         let events: Vec<_> = result_stream.collect().await;
 
         let event_types = collect_event_types(events);
@@ -1112,7 +1161,14 @@ mod tests {
         let model = "test-model";
         let request = make_test_request();
 
-        let result_stream = stream_responses_sse(stream, model, created_ts, &request, 1);
+        let result_stream = stream_responses_sse(
+            stream,
+            model,
+            created_ts,
+            &request,
+            1,
+            TranslationSession::new(),
+        );
         let events: Vec<_> = result_stream.collect().await;
 
         let event_types = collect_event_types(events);

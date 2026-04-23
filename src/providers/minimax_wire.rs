@@ -1,113 +1,9 @@
 use crate::error::{ProviderError, ProxyError};
+use crate::providers::minimax_session::TranslationSession;
 use crate::schema::sse::ResponseObject;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::collections::HashMap;
-use tracing::debug;
-
-// Thread-local storage for tracking tool_use.id mappings
-// This is needed because:
-// 1. We send tool_use to MiniMax with our own tool_use.id
-// 2. MiniMax sends back tool_use in SSE with its own call_id
-// 3. Codex sends function_call_output with MiniMax's call_id (from SSE)
-// 4. We need to look up our original tool_use.id to send in tool_result to MiniMax
-//
-// The mapping flow:
-// - During function_call translation: store Codex call_id -> our tool_use.id (if call_id exists)
-// - During SSE processing: map minimax_call_id -> our_tool_use_id (by sequence position)
-// - During function_call_output: look up our_tool_use_id using the call_id from function_call_output
-thread_local! {
-    // Maps Codex call_id (from function_call.call_id) to our tool_use.id
-    static CODEX_CALL_ID_MAPPING: std::cell::RefCell<HashMap<String, String>> =
-        std::cell::RefCell::new(HashMap::new());
-
-    // Maps minimax_call_id (from SSE) to our original tool_use.id
-    static MINIMAX_CALL_ID_MAPPING: std::cell::RefCell<HashMap<String, String>> =
-        std::cell::RefCell::new(HashMap::new());
-
-    // Stores our tool_use.id sequence (ordered as we sent to MiniMax)
-    static OUR_TOOL_USE_IDS: std::cell::RefCell<Vec<String>> =
-        std::cell::RefCell::new(Vec::new());
-
-    // Counter for tracking which tool_use we're processing during SSE
-    static TOOL_USE_COUNTER: std::cell::RefCell<usize> =
-        std::cell::RefCell::new(0);
-}
-
-// Store our tool_use.id sequence before sending to MiniMax
-pub fn set_our_tool_use_ids(ids: Vec<String>) {
-    let len = ids.len();
-    OUR_TOOL_USE_IDS.with(|cell| {
-        *cell.borrow_mut() = ids;
-    });
-    debug!("Stored {} tool_use.ids for mapping", len);
-}
-
-// Store mapping from Codex call_id to our tool_use.id
-// Called during function_call translation (when call_id exists)
-pub fn store_codex_call_id_mapping(codex_call_id: &str, our_tool_id: &str) {
-    CODEX_CALL_ID_MAPPING.with(|map| {
-        map.borrow_mut().insert(codex_call_id.to_string(), our_tool_id.to_string());
-        debug!("Stored mapping: codex_call_id={} -> tool_use_id={}", codex_call_id, our_tool_id);
-    });
-}
-
-// Called during SSE processing when we receive tool_use from MiniMax
-// Stores the mapping: minimax_call_id -> our_tool_use_id (by position)
-pub fn store_call_id_mapping(call_id_minimax: &str) {
-    let our_id = OUR_TOOL_USE_IDS.with(|cell| {
-        let counter = TOOL_USE_COUNTER.with(|c| *c.borrow());
-        let ids = cell.borrow();
-        ids.get(counter).cloned().unwrap_or_else(|| {
-            format!("unknown_tool_{}", counter)
-        })
-    });
-
-    MINIMAX_CALL_ID_MAPPING.with(|map| {
-        map.borrow_mut().insert(call_id_minimax.to_string(), our_id.clone());
-        debug!("Stored mapping: minimax_call_id={} -> our_tool_use_id={}", call_id_minimax, our_id);
-    });
-
-    // Increment counter for next tool_use
-    TOOL_USE_COUNTER.with(|c| {
-        *c.borrow_mut() += 1;
-    });
-}
-
-// Called during function_call_output translation
-// Looks up our original tool_use.id given the call_id from function_call_output
-// First tries CODEX_CALL_ID_MAPPING (if call_id was stored during function_call translation)
-// Falls back to MINIMAX_CALL_ID_MAPPING (if SSE processing stored the mapping)
-pub fn lookup_our_tool_use_id(call_id: &str) -> Option<String> {
-    // First try Codex call_id mapping
-    let result = CODEX_CALL_ID_MAPPING.with(|map| {
-        map.borrow().get(call_id).cloned()
-    });
-    if result.is_some() {
-        return result;
-    }
-    // Fall back to MiniMax call_id mapping
-    MINIMAX_CALL_ID_MAPPING.with(|map| {
-        map.borrow().get(call_id).cloned()
-    })
-}
-
-// Reset thread-local state (call at start of each request)
-pub fn reset_tool_use_mapping() {
-    CODEX_CALL_ID_MAPPING.with(|map| {
-        map.borrow_mut().clear();
-    });
-    MINIMAX_CALL_ID_MAPPING.with(|map| {
-        map.borrow_mut().clear();
-    });
-    OUR_TOOL_USE_IDS.with(|ids| {
-        ids.borrow_mut().clear();
-    });
-    TOOL_USE_COUNTER.with(|c| {
-        *c.borrow_mut() = 0;
-    });
-}
 
 use fp_agent::schema::openai::{
     ChatRequest, Content, Instructions, ResponsesInput, ResponsesRequest, TextPart, Tool,
@@ -265,9 +161,9 @@ pub fn translate_to_anthropic_request(
     raw: &ResponsesRequest,
     chat: &ChatRequest,
     ctx: &TranslateCtx,
+    session: &mut TranslationSession,
 ) -> AnthropicRequest {
-    // Reset tool_use mapping state for this request
-    reset_tool_use_mapping();
+    // session is provided per-request, no reset needed
 
     // Pre-pass: collect all function_call ids in order so we can map them later
     // during SSE stream processing (MiniMax may send back call_id different from ours)
@@ -347,12 +243,19 @@ pub fn translate_to_anthropic_request(
                 let name = item.name.clone().unwrap_or_default();
 
                 // Debug log the raw fields
-                tracing::debug!("function_call name={:?} arguments={:?} input={:?} action={:?}",
-                    name, item.arguments, item.input, item.action);
+                tracing::debug!(
+                    "function_call name={:?} arguments={:?} input={:?} action={:?}",
+                    name,
+                    item.arguments,
+                    item.input,
+                    item.action
+                );
 
                 // Match fp-agent behavior: try arguments first, then input, then action
                 // Codex may send arguments in any of these fields
-                let args_value = item.arguments.as_ref()
+                let args_value = item
+                    .arguments
+                    .as_ref()
                     .or(item.input.as_ref())
                     .or(item.action.as_ref());
 
@@ -362,7 +265,10 @@ pub fn translate_to_anthropic_request(
                 let input: serde_json::Value = match args_value {
                     Some(serde_json::Value::String(s)) if s.trim().is_empty() => {
                         // Empty or whitespace-only string is invalid JSON, treat as empty object
-                        tracing::warn!("function_call arguments is empty or whitespace: {:?}, using {{}}", s);
+                        tracing::warn!(
+                            "function_call arguments is empty or whitespace: {:?}, using {{}}",
+                            s
+                        );
                         serde_json::json!({})
                     }
                     Some(serde_json::Value::String(s)) => {
@@ -374,11 +280,18 @@ pub fn translate_to_anthropic_request(
                                 v
                             }
                             Ok(v) => {
-                                tracing::warn!("function_call arguments parsed but not object: {:?}, using {{}}", v);
+                                tracing::warn!(
+                                    "function_call arguments parsed but not object: {:?}, using {{}}",
+                                    v
+                                );
                                 serde_json::json!({})
                             }
                             Err(e) => {
-                                tracing::warn!("function_call arguments parse failed: {} for s={:?}, using {{}}", e, s);
+                                tracing::warn!(
+                                    "function_call arguments parse failed: {} for s={:?}, using {{}}",
+                                    e,
+                                    s
+                                );
                                 serde_json::json!({})
                             }
                         }
@@ -397,7 +310,10 @@ pub fn translate_to_anthropic_request(
                         match parsed {
                             Some(val) => val,
                             None => {
-                                tracing::warn!("function_call args_value could not be parsed as object: {:?}, using {{}}", v);
+                                tracing::warn!(
+                                    "function_call args_value could not be parsed as object: {:?}, using {{}}",
+                                    v
+                                );
                                 serde_json::json!({})
                             }
                         }
@@ -420,7 +336,7 @@ pub fn translate_to_anthropic_request(
                 // Store mapping: Codex call_id -> our tool_use.id
                 // This allows us to find our tool_use.id when processing function_call_output
                 if let Some(ref codex_call_id) = item.call_id {
-                    store_codex_call_id_mapping(codex_call_id, &id);
+                    session.store_codex_call_id(codex_call_id, &id);
                 }
 
                 // Add tool_use block
@@ -462,10 +378,14 @@ pub fn translate_to_anthropic_request(
 
                 // Look up our original tool_use.id using MiniMax's call_id
                 // This mapping was stored during SSE processing when we received tool_use from MiniMax
-                let tool_use_id = lookup_our_tool_use_id(&minimax_call_id)
+                let tool_use_id = session
+                    .lookup_our_tool_use_id(&minimax_call_id)
                     .unwrap_or_else(|| {
                         // This is a bug - the mapping should have been stored during SSE processing
-                        tracing::warn!("Tool_use ID mapping not found for minimax_call_id={}, this is a bug!", minimax_call_id);
+                        tracing::warn!(
+                            "Tool_use ID mapping not found for minimax_call_id={}, this is a bug!",
+                            minimax_call_id
+                        );
                         minimax_call_id.clone()
                     });
 
@@ -561,7 +481,7 @@ pub fn translate_to_anthropic_request(
         })
         .flatten()
         .collect();
-    set_our_tool_use_ids(tool_use_ids);
+    session.set_our_tool_use_ids(tool_use_ids);
 
     // Build system prompt
     let system = if system_parts.is_empty() {
@@ -583,14 +503,17 @@ pub fn translate_to_anthropic_request(
             .effort_levels
             .get(cfg.default_effort.as_deref().unwrap_or("medium"))
             .map(|e| e.budget)
-            .unwrap_or(16384),
+            .unwrap_or(8192),
     });
 
     AnthropicRequest {
         model: raw.model.clone(),
         messages: anthropic_messages,
         system,
-        max_tokens: raw.max_tokens.unwrap_or(ctx.default_max_tokens),
+        max_tokens: raw
+            .max_output_tokens
+            .or(raw.max_tokens)
+            .unwrap_or(ctx.default_max_tokens),
         stream: ctx.stream,
         tools,
         tool_choice,
@@ -609,28 +532,28 @@ fn translate_content_to_anthropic(
         Some(Content::Json(v)) => vec![AnthropicContentBlock::Text {
             text: v.to_string(),
         }],
-        Some(Content::Parts(parts)) => {
-            parts
-                .iter()
-                .filter_map(|part| match part.part_type.as_str() {
-                    "text" => part
-                        .text
-                        .as_ref()
-                        .map(|t| AnthropicContentBlock::Text { text: t.clone() }),
-                    "image_url" => {
-                        // Logged in caller
+        Some(Content::Parts(parts)) => parts
+            .iter()
+            .filter_map(|part| match part.part_type.as_str() {
+                "text" => part
+                    .text
+                    .as_ref()
+                    .map(|t| AnthropicContentBlock::Text { text: t.clone() }),
+                "image_url" => {
+                    tracing::warn!(
+                        "image content dropped: Minimax Anthropic endpoint does not support images"
+                    );
+                    None
+                }
+                _ => {
+                    if let Some(text) = &part.text {
+                        Some(AnthropicContentBlock::Text { text: text.clone() })
+                    } else {
                         None
                     }
-                    _ => {
-                        if let Some(text) = &part.text {
-                            Some(AnthropicContentBlock::Text { text: text.clone() })
-                        } else {
-                            None
-                        }
-                    }
-                })
-                .collect()
-        }
+                }
+            })
+            .collect(),
         None => Vec::new(),
     }
 }
@@ -650,11 +573,71 @@ fn translate_content_to_text(content: &Content) -> String {
 fn translate_tools(tools: &[Tool]) -> Vec<AnthropicTool> {
     tools
         .iter()
-        .filter_map(|tool| {
+        .flat_map(|tool| {
             // Skip web_search/hosted tools
             if tool.web_search.is_some() {
-                tracing::warn!("web_search tool dropped for Anthropic compatibility");
-                return None;
+                tracing::warn!(
+                    "web_search tool skipped: MiniMax uses MCP, not Anthropic hosted tools"
+                );
+                return vec![].into_iter();
+            }
+
+            // Handle namespace container - flatten to qualified names
+            // Codex sends namespace containers to support deferred loading of MCP tools
+            // e.g. mcp__codex_apps__calendar + "__" + create_event
+            if tool.tool_type == "namespace" {
+                if let Some(inner_tools) = &tool.tools {
+                    let parent_prefix = tool.name.as_deref().unwrap_or("");
+                    return inner_tools
+                        .iter()
+                        .filter_map(|inner| {
+                            if inner.tool_type != "function" {
+                                return None;
+                            }
+                            // Extract name: function.name > tool.name > ""
+                            let inner_name = inner
+                                .function
+                                .as_ref()
+                                .map(|f| f.name.clone())
+                                .or_else(|| inner.name.clone())
+                                .unwrap_or_default();
+                            let qualified_name = if parent_prefix.is_empty() {
+                                inner_name
+                            } else if parent_prefix.ends_with("__") {
+                                format!("{}{}", parent_prefix, inner_name)
+                            } else {
+                                format!("{}__{}", parent_prefix, inner_name)
+                            };
+
+                            // Anthropic tool name limit: 64 chars
+                            if qualified_name.len() > 64 {
+                                tracing::warn!(
+                                    "tool name exceeds 64-char limit ({}): '{}'. Consider shortening MCP server/tool names in Codex client.",
+                                    qualified_name.len(),
+                                    qualified_name
+                                );
+                                return None;
+                            }
+
+                            Some(AnthropicTool {
+                                name: qualified_name,
+                                description: inner
+                                    .function
+                                    .as_ref()
+                                    .and_then(|f| f.description.clone())
+                                    .or(inner.description.clone()),
+                                input_schema: inner
+                                    .function
+                                    .as_ref()
+                                    .and_then(|f| f.parameters.clone())
+                                    .or_else(|| inner.parameters.clone())
+                                    .unwrap_or(serde_json::json!({})),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter();
+                }
+                return vec![].into_iter();
             }
 
             // Extract function info
@@ -674,14 +657,22 @@ fn translate_tools(tools: &[Tool]) -> Vec<AnthropicTool> {
             };
 
             if name.is_empty() {
-                return None;
+                vec![].into_iter()
+            } else if name.len() > 64 {
+                tracing::warn!(
+                    "tool name exceeds 64-char limit ({}): '{}'. Consider shortening MCP server/tool names in Codex client.",
+                    name.len(),
+                    name
+                );
+                vec![].into_iter()
+            } else {
+                vec![AnthropicTool {
+                    name,
+                    description,
+                    input_schema,
+                }]
+                .into_iter()
             }
-
-            Some(AnthropicTool {
-                name,
-                description,
-                input_schema,
-            })
         })
         .collect()
 }
@@ -690,12 +681,104 @@ fn translate_tool_choice(tool_choice: &Option<String>) -> Option<serde_json::Val
     tool_choice.as_ref().map(|choice| match choice.as_str() {
         "auto" => serde_json::json!({ "type": "auto" }),
         "required" | "any" => serde_json::json!({ "type": "any" }),
-        s if s.starts_with("tool") || s.contains('{') => {
-            // Try to parse as named tool
+        "none" => serde_json::json!({ "type": "auto" }),
+        s => {
+            // Named tool: any other string is treated as a tool name
             serde_json::json!({ "type": "tool", "name": s })
         }
-        _ => serde_json::json!({ "type": "auto" }),
     })
+}
+
+/// Extract namespace from a qualified tool name like `mcp__server__tool`.
+/// Returns (namespace, inner_name) if qualified, else (None, original_name).
+///
+/// Handles two formats:
+/// - 3-underscore: `mcp__server__tool` → namespace=`mcp__server__`, inner=`tool`
+///   Note: namespace retains trailing `__` for round-trip reconstruction
+/// - 4-underscore: `mcp__server_name__tool` (server name contains `_`)
+///   e.g. `mcp__grep_app____searchGitHub` → namespace=`mcp__grep_app__`, inner=`searchGitHub`
+///
+/// Falls back to heuristic splitting when the model sends a malformed name like
+/// `mcp__grepsearchGitHub` (missing delimiter). This tries to find a known tool
+/// name suffix and reconstruct the qualified name.
+pub fn extract_namespace(name: &str) -> (Option<String>, String) {
+    const PREFIX: &str = "mcp__";
+    const DELIMITER: &str = "__";
+    if let Some(rest) = name.strip_prefix(PREFIX) {
+        // 4-underscore format: mcp__server_with_underscores____tool
+        // Server name may contain underscores, use ____ as delimiter
+        if let Some(pos) = rest.find("____") {
+            // namespace includes trailing __ to match Codex convention
+            let ns = format!("{}{}{}", PREFIX, &rest[..pos], DELIMITER);
+            let inner = rest[pos + 4..].to_string();
+            return (Some(ns), inner);
+        }
+        // 3-underscore format: mcp__server__tool
+        // namespace includes trailing __ for round-trip reconstruction
+        if let Some(pos) = rest.find(DELIMITER) {
+            // ns includes the delimiter, inner starts after it
+            let ns = format!("{}{}{}", PREFIX, &rest[..pos], DELIMITER);
+            let inner = rest[pos + 2..].to_string();
+            return (Some(ns), inner);
+        }
+        // Fallback: model sent malformed name like "mcp__grepsearchGitHub" (missing __)
+        // Try to find a reasonable split point by looking for common tool name patterns
+        if let Some((ns, inner)) = try_fallback_split(rest) {
+            // Fallback namespace includes trailing __ to enable correct round-trip
+            // When Codex combines namespace + name, we need the trailing __ to reconstruct
+            // mcp__grep__ + searchGitHub = mcp__grep__searchGitHub (correct)
+            // Without it: mcp__grep + searchGitHub = mcp__grepsearchGitHub (still broken)
+            return (Some(format!("{}{}{}", PREFIX, ns, DELIMITER)), inner);
+        }
+    }
+    (None, name.to_string())
+}
+
+/// Fallback heuristic for malformed MCP tool names.
+/// When the model sends "grepsearchGitHub" instead of "grep__searchGitHub",
+/// we try to detect common tool name suffixes and reconstruct the qualified name.
+///
+/// Note: This is a best-effort heuristic. If the server name contains underscores
+/// (e.g., "grep_app"), the model might have concatenated them incorrectly.
+/// For "grepsearchGitHub", we can't know if the server is "grep" or "grep_app".
+/// We assume the server name is everything before the known suffix.
+fn try_fallback_split(rest: &str) -> Option<(&str, String)> {
+    // Known tool name suffixes that indicate where the tool name starts
+    // These are common patterns that appear after the server name
+    let known_suffixes = [
+        "searchGitHub",
+        "searchGithub",
+        "listRepos",
+        "list_repos",
+        "getFile",
+        "get_file",
+        "createIssue",
+        "create_issue",
+        "searchCode",
+        "search_code",
+        "getRepo",
+        "get_repo",
+        "createPullRequest",
+        "create_pull_request",
+    ];
+    for suffix in &known_suffixes {
+        if let Some(pos) = rest.find(suffix) {
+            // The server name is everything before the suffix
+            let server = &rest[..pos];
+            // The tool name is the suffix
+            let tool = suffix.to_string();
+            // Only accept if server looks like a valid MCP server name (not empty, no spaces)
+            if !server.is_empty()
+                && !server.contains(' ')
+                && server
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            {
+                return Some((server, tool));
+            }
+        }
+    }
+    None
 }
 
 /// Translates AnthropicResponse into ResponseObject
@@ -721,21 +804,23 @@ pub fn translate_to_responses_response(resp: AnthropicResponse) -> ResponseObjec
             }
             AnthropicResponseBlock::ToolUse { id, name, input } => {
                 let arguments = input.to_string();
+                let (namespace, inner_name) = extract_namespace(name);
                 output_items.push(crate::schema::sse::OutputItem::FunctionCall(
                     crate::schema::sse::FunctionCallItem {
                         id: format!("{}_{}", item_id_base, item_counter),
                         status: "completed".to_string(),
-                        name: name.clone(),
+                        name: inner_name,
                         arguments,
                         call_id: id.clone(),
                         thought_signature: None,
+                        namespace,
                     },
                 ));
                 item_counter += 1;
             }
             AnthropicResponseBlock::Thinking {
                 thinking,
-                signature: _,
+                signature,
             } => {
                 output_items.push(crate::schema::sse::OutputItem::Reasoning(
                     crate::schema::sse::ReasoningItem {
@@ -745,6 +830,7 @@ pub fn translate_to_responses_response(resp: AnthropicResponse) -> ResponseObjec
                         content: vec![crate::schema::sse::ReasoningContentPart::ReasoningText {
                             text: thinking.clone(),
                         }],
+                        thought_signature: signature.clone(),
                     },
                 ));
                 item_counter += 1;
@@ -783,12 +869,15 @@ pub fn translate_to_responses_response(resp: AnthropicResponse) -> ResponseObjec
 }
 
 /// Checks Minimax business errors
-pub fn check_base_resp(resp: &AnthropicResponse) -> Result<(), ProxyError> {
+pub fn check_base_resp(resp: &AnthropicResponse, model: &str) -> Result<(), ProxyError> {
     if let Some(br) = &resp.base_resp {
         if br.status_code != 0 {
             return Err(ProxyError::Provider(ProviderError::new(
                 Some(StatusCode::BAD_GATEWAY),
-                format!("Minimax error ({}): {}", br.status_code, br.status_msg),
+                format!(
+                    "Minimax error ({}) [{}]: {}",
+                    model, br.status_code, br.status_msg
+                ),
             )));
         }
     }
@@ -798,6 +887,7 @@ pub fn check_base_resp(resp: &AnthropicResponse) -> Result<(), ProxyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::openai;
     use crate::schema::sse::{OutputContentPart, OutputItem};
     use fp_agent::schema::openai::InputItem;
 
@@ -842,7 +932,8 @@ mod tests {
             stream: false,
         };
 
-        let req = translate_to_anthropic_request(&raw, &chat, &ctx);
+        let mut session = TranslationSession::new();
+        let req = translate_to_anthropic_request(&raw, &chat, &ctx, &mut session);
 
         assert!(req.system.is_some());
         assert!(req.system.unwrap().contains("helpful assistant"));
@@ -916,7 +1007,8 @@ mod tests {
             stream: false,
         };
 
-        let req = translate_to_anthropic_request(&raw, &chat, &ctx);
+        let mut session = TranslationSession::new();
+        let req = translate_to_anthropic_request(&raw, &chat, &ctx, &mut session);
 
         assert!(req.system.is_some());
         let system = req.system.unwrap();
@@ -1039,7 +1131,8 @@ mod tests {
             stream: false,
         };
 
-        let req = translate_to_anthropic_request(&raw, &chat, &ctx);
+        let mut session = TranslationSession::new();
+        let req = translate_to_anthropic_request(&raw, &chat, &ctx, &mut session);
 
         // Should have user message, assistant message with tool_use, user message with tool_result
         assert_eq!(req.messages.len(), 3);
@@ -1139,10 +1232,11 @@ mod tests {
             }),
         };
 
-        let result = check_base_resp(&resp);
+        let result = check_base_resp(&resp, "test-model");
         assert!(result.is_err());
 
         if let Err(ProxyError::Provider(err)) = result {
+            assert!(err.message.contains("test-model"));
             assert!(err.message.contains("1001"));
             assert!(err.message.contains("Model not available"));
         } else {
@@ -1167,15 +1261,17 @@ mod tests {
         assert!(any.is_some());
         assert_eq!(any.unwrap(), serde_json::json!({ "type": "any" }));
 
-        // Test none (invalid for Anthropic)
+        // Test none
         let none = translate_tool_choice(&None);
         assert!(none.is_none());
 
-        // Test named tool
+        // Test named tool - should produce {type: "tool", name: "get_weather"}
         let named = translate_tool_choice(&Some("get_weather".into()));
         assert!(named.is_some());
-        // Should default to auto for unknown patterns
-        assert_eq!(named.unwrap(), serde_json::json!({ "type": "auto" }));
+        assert_eq!(
+            named.unwrap(),
+            serde_json::json!({ "type": "tool", "name": "get_weather" })
+        );
     }
 
     #[test]
@@ -1229,7 +1325,8 @@ mod tests {
             stream: false,
         };
 
-        let req = translate_to_anthropic_request(&raw, &chat, &ctx);
+        let mut session = TranslationSession::new();
+        let req = translate_to_anthropic_request(&raw, &chat, &ctx, &mut session);
 
         // Should include the text with URL
         assert_eq!(req.messages.len(), 1);
@@ -1243,5 +1340,168 @@ mod tests {
                 _ => panic!("Expected text block"),
             }
         }
+    }
+
+    #[test]
+    fn test_translate_namespace_flattens_inner_tools() {
+        use super::*;
+        let namespace_tool = Tool {
+            tool_type: "namespace".to_string(),
+            function: None,
+            name: Some("mcp__codex_apps__calendar".to_string()),
+            description: Some("Calendar MCP".to_string()),
+            parameters: None,
+            strict: None,
+            web_search: None,
+            tools: Some(vec![
+                Tool {
+                    tool_type: "function".to_string(),
+                    function: Some(openai::FunctionDef {
+                        name: "create_event".to_string(),
+                        description: Some("Create a calendar event".to_string()),
+                        parameters: Some(serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"}
+                            }
+                        })),
+                    }),
+                    name: None,
+                    description: None,
+                    parameters: None,
+                    strict: None,
+                    web_search: None,
+                    tools: None,
+                },
+                Tool {
+                    tool_type: "function".to_string(),
+                    function: Some(openai::FunctionDef {
+                        name: "list_events".to_string(),
+                        description: Some("List calendar events".to_string()),
+                        parameters: Some(serde_json::json!({
+                            "type": "object",
+                            "properties": {}
+                        })),
+                    }),
+                    name: None,
+                    description: None,
+                    parameters: None,
+                    strict: None,
+                    web_search: None,
+                    tools: None,
+                },
+            ]),
+        };
+
+        let result = translate_tools(&[namespace_tool]);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].name, "mcp__codex_apps__calendar__create_event");
+        assert_eq!(result[1].name, "mcp__codex_apps__calendar__list_events");
+    }
+
+    #[test]
+    fn translate_tool_name_exceeds_64_chars_is_dropped() {
+        let long_name =
+            "mcp__codex_apps_marketplace__gmail_send_email_with_attachment_and_cc".to_string();
+        assert!(long_name.len() > 64);
+        let tool = openai::Tool {
+            tool_type: "function".to_string(),
+            function: Some(openai::FunctionDef {
+                name: long_name.clone(),
+                description: Some("Send email".to_string()),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                })),
+            }),
+            name: None,
+            description: None,
+            parameters: None,
+            strict: None,
+            web_search: None,
+            tools: None,
+        };
+        let result = translate_tools(&[tool]);
+        assert!(
+            result.is_empty(),
+            "tool with name > 64 chars should be dropped"
+        );
+    }
+
+    #[test]
+    fn translate_tool_name_exactly_64_chars_passes() {
+        let name = "m".repeat(64);
+        assert_eq!(name.len(), 64);
+        let tool = openai::Tool {
+            tool_type: "function".to_string(),
+            function: Some(openai::FunctionDef {
+                name: name.clone(),
+                description: Some("A 64-char tool".to_string()),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                })),
+            }),
+            name: None,
+            description: None,
+            parameters: None,
+            strict: None,
+            web_search: None,
+            tools: None,
+        };
+        let result = translate_tools(&[tool]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, name);
+    }
+
+    #[test]
+    fn extract_namespace_qualified_name() {
+        // mcp__<server>__<tool> where server = "codex_apps" (no underscores in server name)
+        // namespace retains trailing __ for round-trip reconstruction
+        let (ns, name) = extract_namespace("mcp__codex_apps__create_event");
+        assert_eq!(ns, Some("mcp__codex_apps__".to_string()));
+        assert_eq!(name, "create_event");
+    }
+
+    #[test]
+    fn extract_namespace_server_with_underscore() {
+        // mcp__<server_with_underscore>____<tool> format
+        // e.g. mcp__grep_app____searchGitHub
+        // namespace retains trailing __ for round-trip reconstruction
+        let (ns, name) = extract_namespace("mcp__grep_app____searchGitHub");
+        assert_eq!(ns, Some("mcp__grep_app__".to_string()));
+        assert_eq!(name, "searchGitHub");
+    }
+
+    #[test]
+    fn extract_namespace_non_qualified_name() {
+        let (ns, name) = extract_namespace("get_weather");
+        assert_eq!(ns, None);
+        assert_eq!(name, "get_weather");
+    }
+
+    #[test]
+    fn extract_namespace_partial_mcp_prefix() {
+        let (ns, name) = extract_namespace("mcpc__server__tool");
+        assert_eq!(ns, None);
+        assert_eq!(name, "mcpc__server__tool");
+    }
+
+    #[test]
+    fn extract_namespace_no_inner_separator() {
+        let (ns, name) = extract_namespace("mcp__serveronly");
+        assert_eq!(ns, None);
+        assert_eq!(name, "mcp__serveronly");
+    }
+
+    #[test]
+    fn extract_namespace_fallback_for_truncated_name() {
+        // Model sent "mcp__grepsearchGitHub" instead of "mcp__grep__searchGitHub"
+        // Fallback should detect "searchGitHub" suffix and reconstruct
+        // Fallback includes trailing __ to enable correct round-trip:
+        // namespace "mcp__grep__" + name "searchGitHub" = "mcp__grep__searchGitHub" (correct)
+        let (ns, name) = extract_namespace("mcp__grepsearchGitHub");
+        assert_eq!(ns, Some("mcp__grep__".to_string()));
+        assert_eq!(name, "searchGitHub");
     }
 }

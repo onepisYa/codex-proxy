@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use crate::config::with_config;
 use crate::error::{ProviderError, ProxyError};
 use crate::providers::base::{Provider, ProviderExecutionContext};
+use crate::providers::minimax_session::TranslationSession;
 use crate::providers::minimax_stream::stream_responses_sse;
 use crate::providers::minimax_wire::{
     AnthropicResponse, AnthropicResponseBlock, TranslateCtx, check_base_resp,
@@ -16,7 +17,7 @@ use crate::schema::sse::{MessageItem, OutputContentPart, OutputItem, ResponseObj
 use fp_agent::normalize::normalize_responses_request;
 use reqwest::header::AUTHORIZATION;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, error};
+use tracing::{Instrument, debug, error, info_span};
 
 pub struct MinimaxProvider {
     client: reqwest::Client,
@@ -80,91 +81,119 @@ impl MinimaxProvider {
         chat: ChatRequest,
         context: ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
-        // Resolve auth
-        let auth_value = resolve_minimax_auth(&context)?;
-
-        // Build endpoint URL
-        let base_url = resolve_endpoint_url(&context)?;
-        let url = build_messages_url(&base_url);
-
-        // Determine stream mode
-        let is_stream = chat.stream;
-
-        // Build translate context
-        let ctx = TranslateCtx {
-            reasoning: context
-                .reasoning()
-                .cloned()
-                .map(|r| crate::config::ReasoningConfig {
-                    effort_levels: r
-                        .preset
-                        .as_ref()
-                        .map(|p| {
-                            let mut m = HashMap::new();
-                            m.insert(
-                                p.clone(),
-                                crate::config::EffortLevel {
-                                    budget: r.budget,
-                                    level: r.level.clone(),
-                                },
-                            );
-                            m
-                        })
-                        .unwrap_or_default(),
-                    default_effort: r.preset.clone(),
-                }),
-            default_max_tokens: 4096,
-            stream: is_stream,
-        };
-
-        // Translate request
-        let anthropic_req = translate_to_anthropic_request(&raw, &chat, &ctx);
-
-        // Build headers
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, auth_value);
-        headers.insert(
-            "Content-Type",
-            "application/json"
-                .parse()
-                .map_err(|_| ProxyError::Internal("Invalid content type".into()))?,
+        let span = info_span!(
+            "minimax_request",
+            model = %context.upstream_model(),
+            stream = %chat.stream,
+            account_id = %context.account.id
         );
 
-        debug!("Minimax request to {}", url);
-        debug!("Minimax request body: {:?}", anthropic_req);
+        async move {
+            // Resolve auth
+            let auth_value = resolve_minimax_auth(&context)?;
 
-        // Send request
-        let resp = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&anthropic_req)
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Minimax HTTP request failed: {}", e);
-                ProxyError::Http(e)
-            })?;
+            // Build endpoint URL
+            let base_url = resolve_endpoint_url(&context)?;
+            let url = build_messages_url(&base_url);
 
-        let status = resp.status();
-        debug!("Minimax response status: {}", status);
+            // Determine stream mode
+            let is_stream = chat.stream;
 
-        if is_stream {
-            self.handle_stream_response(resp, &chat, &context).await
-        } else {
-            self.handle_sync_response(resp).await
+            // Resolve default_max_tokens from config
+            let default_max_tokens = resolve_default_max_tokens(&context)?;
+
+            // Build translate context
+            let ctx = TranslateCtx {
+                reasoning: context
+                    .reasoning()
+                    .cloned()
+                    .map(|r| crate::config::ReasoningConfig {
+                        effort_levels: r
+                            .preset
+                            .as_ref()
+                            .map(|p| {
+                                let mut m = HashMap::new();
+                                m.insert(
+                                    p.clone(),
+                                    crate::config::EffortLevel {
+                                        budget: r.budget,
+                                        level: r.level.clone(),
+                                    },
+                                );
+                                m
+                            })
+                            .unwrap_or_default(),
+                        default_effort: r.preset.clone(),
+                    }),
+                default_max_tokens,
+                stream: is_stream,
+            };
+
+            // Create translation session for this request
+            let mut session = TranslationSession::new();
+
+            // Translate request
+            let anthropic_req = translate_to_anthropic_request(&raw, &chat, &ctx, &mut session);
+
+            // Build headers
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, auth_value);
+            headers.insert(
+                "Content-Type",
+                "application/json"
+                    .parse()
+                    .map_err(|_| ProxyError::Internal("Invalid content type".into()))?,
+            );
+
+            debug!("Minimax request to {}", url);
+            debug!("Minimax request body: {:?}", anthropic_req);
+
+            // Send request
+            let resp = self
+                .client
+                .post(&url)
+                .headers(headers)
+                .json(&anthropic_req)
+                .send()
+                .await
+                .map_err(|e| {
+                    error!("Minimax HTTP request failed: {}", e);
+                    ProxyError::Http(e)
+                })?;
+
+            let status = resp.status();
+            debug!("Minimax response status: {}", status);
+
+            if is_stream {
+                self.handle_stream_response(resp, &chat, &context, session)
+                    .await
+            } else {
+                self.handle_sync_response(resp, context.upstream_model())
+                    .await
+            }
         }
+        .instrument(span)
+        .await
     }
 
     async fn handle_sync_response(
         &self,
         resp: reqwest::Response,
+        model: &str,
     ) -> Result<Response<Body>, ProxyError> {
         let status = resp.status();
 
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             error!("Minimax sync error: {} - {}", status, body);
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(ProxyError::Auth(format!(
+                    "Minimax request unauthorized ({}). Body: {}",
+                    status, body
+                )));
+            }
             return Err(ProxyError::Provider(ProviderError::new(
                 Some(status),
                 format!("Minimax error: {} - {}", status, body),
@@ -177,7 +206,7 @@ impl MinimaxProvider {
             ProxyError::Internal(format!("Failed to parse Minimax response: {}", e))
         })?;
 
-        check_base_resp(&anthropic_resp)?;
+        check_base_resp(&anthropic_resp, model)?;
 
         let responses_resp = translate_to_responses_response(anthropic_resp);
 
@@ -196,6 +225,7 @@ impl MinimaxProvider {
         resp: reqwest::Response,
         chat: &ChatRequest,
         context: &ProviderExecutionContext,
+        session: TranslationSession,
     ) -> Result<Response<Body>, ProxyError> {
         let status = resp.status();
 
@@ -203,6 +233,14 @@ impl MinimaxProvider {
             let body_bytes = resp.bytes().await.unwrap_or_default();
             let body_str = String::from_utf8_lossy(&body_bytes);
             error!("Minimax stream error: {} - {}", status, body_str);
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(ProxyError::Auth(format!(
+                    "Minimax stream request unauthorized ({}). Body: {}",
+                    status, body_str
+                )));
+            }
             return Err(ProxyError::Provider(ProviderError::new(
                 Some(status),
                 format!("Minimax error: {} - {}", status, body_str),
@@ -217,9 +255,13 @@ impl MinimaxProvider {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        debug!("SSE STREAM: building byte stream from response, idle_timeout={}", idle_timeout);
+        debug!(
+            "SSE STREAM: building byte stream from response, idle_timeout={}",
+            idle_timeout
+        );
         let byte_stream = resp.bytes_stream();
-        let stream = stream_responses_sse(byte_stream, &model, created_ts, chat, idle_timeout);
+        let stream =
+            stream_responses_sse(byte_stream, &model, created_ts, chat, idle_timeout, session);
         debug!("SSE STREAM: stream created, converting to body");
 
         Ok(Response::builder()
@@ -238,8 +280,9 @@ impl MinimaxProvider {
         context: ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
         // 1. Construct Anthropic request from CompactRequest
+        let model = context.upstream_model().to_string();
         let synth_raw = ResponsesRequest {
-            model: context.upstream_model().to_string(),
+            model: model.clone(),
             input: Some(data.input.clone()),
             instructions: Some(data.instructions.clone()),
             messages: None,
@@ -251,19 +294,21 @@ impl MinimaxProvider {
             stream: Some(false),
             temperature: Some(0.1),
             top_p: None,
-            max_tokens: Some(4096),
+            max_tokens: Some(resolve_default_max_tokens(&context)?),
             max_output_tokens: None,
             include: None,
         };
         let synth_chat = normalize_responses_request(&synth_raw);
+        let mut session = TranslationSession::new();
         let anth_req = translate_to_anthropic_request(
             &synth_raw,
             &synth_chat,
             &TranslateCtx {
                 stream: false,
-                default_max_tokens: 4096,
+                default_max_tokens: resolve_default_max_tokens(&context)?,
                 reasoning: None,
             },
+            &mut session,
         );
 
         // 2. Send non-streaming Minimax request
@@ -306,7 +351,7 @@ impl MinimaxProvider {
         let anth: AnthropicResponse = serde_json::from_slice(&bytes).map_err(|e| {
             ProxyError::Internal(format!("Failed to parse Minimax compact response: {}", e))
         })?;
-        check_base_resp(&anth)?;
+        check_base_resp(&anth, &model)?;
 
         let summary = anth
             .content
@@ -372,6 +417,14 @@ fn resolve_minimax_auth(context: &ProviderExecutionContext) -> Result<HeaderValu
 fn resolve_endpoint_url(context: &ProviderExecutionContext) -> Result<String, ProxyError> {
     with_config(&context.config, |cfg| {
         cfg.endpoint_url(context.provider(), context.endpoint_name())
+    })
+    .map_err(ProxyError::Config)
+}
+
+fn resolve_default_max_tokens(context: &ProviderExecutionContext) -> Result<u64, ProxyError> {
+    with_config(&context.config, |cfg| {
+        cfg.minimax_provider_config(context.provider())
+            .map(|c| c.default_max_tokens)
     })
     .map_err(ProxyError::Config)
 }

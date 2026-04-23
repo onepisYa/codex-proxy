@@ -195,6 +195,7 @@ pub fn stream_responses_sse(
                                 arguments: fc_args_str,
                                 call_id: call_id.clone(),
                                 thought_signature: p.thought_signature.clone(),
+                                namespace: None,
                             })
                         };
 
@@ -256,6 +257,7 @@ pub fn stream_responses_sse(
                             status: "in_progress".into(),
                             summary: Vec::new(),
                             content: vec![ReasoningContentPart::ReasoningText { text: String::new() }],
+                            thought_signature: None,
                         });
                         active_reasoning = Some((idx, item));
                     }

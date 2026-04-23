@@ -151,6 +151,7 @@ pub fn stream_responses_sse(
                             arguments: String::new(),
                             call_id: call_id.clone(),
                             thought_signature: None,
+                            namespace: None,
                         });
 
                         ToolCallState {
@@ -341,6 +342,7 @@ fn finalize_tool_call(tc: &ToolCallState) -> OutputItem {
             arguments: args,
             call_id: call_id.clone(),
             thought_signature: None,
+            namespace: None,
         })
     }
 }

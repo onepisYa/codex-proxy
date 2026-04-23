@@ -98,7 +98,10 @@ fn start_recovery_probe_loop(state: &AppState) {
 
 async fn run_recovery_probe_pass(state: &AppState) {
     let candidates: Vec<usize> = state.accounts().recovery_candidates();
-    debug!("run_recovery_probe_pass: candidates_len={}", candidates.len());
+    debug!(
+        "run_recovery_probe_pass: candidates_len={}",
+        candidates.len()
+    );
 
     // Phase 1: Collect all account data and targets FIRST, before claiming any probes.
     // This prevents the bug where begin_recovery_probe succeeds but data collection fails,
@@ -174,7 +177,10 @@ async fn execute_probe_for_account(
     _snapshot: &crate::account_pool::AccountSnapshot,
     target: &crate::config::RouteTargetConfig,
 ) -> (bool, Option<String>) {
-    debug!("execute_probe_for_account START: index={} provider={}", index, account.provider);
+    debug!(
+        "execute_probe_for_account START: index={} provider={}",
+        index, account.provider
+    );
     let provider_name = account.provider.clone();
     let account_id = account.id.clone();
 
@@ -242,7 +248,10 @@ async fn execute_probe_for_account(
     let result = provider
         .handle_request(raw, normalized, HeaderMap::new(), context)
         .await;
-    debug!("execute_probe_for_account END: index={} provider={} result={:?}", index, provider_name, result);
+    debug!(
+        "execute_probe_for_account END: index={} provider={} result={:?}",
+        index, provider_name, result
+    );
     match result {
         Ok(_) => (true, None),
         Err(err) => {
@@ -537,13 +546,23 @@ async fn responses_handler(
 ) -> Result<Response<Body>, ProxyError> {
     // Debug: log raw request input
     tracing::debug!("responses_handler raw request: input={:?}", data.input);
-    tracing::debug!("responses_handler raw request: messages={:?}", data.messages);
+    tracing::debug!(
+        "responses_handler raw request: messages={:?}",
+        data.messages
+    );
     if let Some(ref input) = data.input {
         match input {
             ResponsesInput::Items(items) => {
                 for (i, item) in items.iter().enumerate() {
-                    tracing::debug!("responses_handler input item[{}]: type={} id={:?} call_id={:?} name={:?} arguments={:?}",
-                        i, item.item_type, item.id, item.call_id, item.name, item.arguments);
+                    tracing::debug!(
+                        "responses_handler input item[{}]: type={} id={:?} call_id={:?} name={:?} arguments={:?}",
+                        i,
+                        item.item_type,
+                        item.id,
+                        item.call_id,
+                        item.name,
+                        item.arguments
+                    );
                 }
             }
             ResponsesInput::Text(text) => {
@@ -574,9 +593,20 @@ async fn responses_handler(
     // Debug: log tool_calls in normalized messages
     for (i, msg) in normalized.messages.iter().enumerate() {
         if !msg.tool_calls.is_empty() {
-            tracing::debug!("responses_handler: normalized message[{}] role={} has {} tool_calls", i, msg.role, msg.tool_calls.len());
+            tracing::debug!(
+                "responses_handler: normalized message[{}] role={} has {} tool_calls",
+                i,
+                msg.role,
+                msg.tool_calls.len()
+            );
             for (j, tc) in msg.tool_calls.iter().enumerate() {
-                tracing::debug!("responses_handler: tool_call[{}] id={} name={} args={}", j, tc.id, tc.function.name, tc.function.arguments);
+                tracing::debug!(
+                    "responses_handler: tool_call[{}] id={} name={} args={}",
+                    j,
+                    tc.id,
+                    tc.function.name,
+                    tc.function.arguments
+                );
             }
         }
     }

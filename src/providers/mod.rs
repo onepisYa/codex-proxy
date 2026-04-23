@@ -2,6 +2,7 @@ pub mod base;
 pub mod gemini;
 pub mod gemini_stream;
 pub mod minimax;
+pub mod minimax_session;
 pub mod minimax_stream;
 pub mod minimax_wire;
 pub mod openai;

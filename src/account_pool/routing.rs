@@ -164,7 +164,11 @@ impl Router {
         let cache_key =
             cache_key_override.unwrap_or_else(|| compute_cache_key(&message_signature(messages)));
 
-        debug!("Routing: cache_key={}, candidates_len={}", cache_key, candidates.len());
+        debug!(
+            "Routing: cache_key={}, candidates_len={}",
+            cache_key,
+            candidates.len()
+        );
 
         if let Some(binding) = state.sticky_bindings.read().get(&cache_key).cloned() {
             for candidate in candidates {
