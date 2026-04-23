@@ -222,3 +222,4 @@ secrets.json
 *.local
 .DS_Store
 .omx/
+.worktrees/
