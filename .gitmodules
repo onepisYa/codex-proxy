@@ -1,4 +1,4 @@
 [submodule "third_party/FerroPhase"]
 	path = third_party/FerroPhase
 	url = https://github.com/onepisYa/FerroPhase
-	branch = fix/allow-namespace-tool-type
+	branch = main
