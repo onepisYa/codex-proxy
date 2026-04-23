@@ -8,7 +8,6 @@ pub mod minimax_wire;
 pub mod openai;
 pub mod openrouter;
 pub mod zai;
-pub mod zai_stream;
 
 use std::collections::HashMap;
 

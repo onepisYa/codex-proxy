@@ -1,22 +1,23 @@
 use axum::body::Body;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::info;
+use std::collections::HashMap;
 
-use crate::account_pool::AccountAuth;
 use crate::config::with_config;
 use crate::error::{ProviderError, ProxyError};
 use crate::providers::base::{Provider, ProviderExecutionContext};
+use crate::providers::minimax_session::TranslationSession;
+use crate::providers::minimax_stream::stream_responses_sse;
+use crate::providers::minimax_wire::{
+    AnthropicResponse, AnthropicResponseBlock, TranslateCtx,
+    check_base_resp, translate_to_anthropic_request, translate_to_responses_response,
+};
 use crate::schema::openai::{ChatRequest, ResponsesRequest};
-use crate::schema::sse::{
-    FunctionCallItem, LocalShellCallItem, MessageItem, OutputContentPart, OutputItem,
-    ResponseObject, Usage,
-};
-use fp_agent::providers::adapter::{
-    ProviderBuildContext, ProviderKind, ProviderPayload, ProviderRequest, build_provider_payload,
-};
+use crate::schema::sse::{MessageItem, OutputContentPart, OutputItem, ResponseObject, Usage};
+use fp_agent::normalize::normalize_responses_request;
+use reqwest::header::AUTHORIZATION;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, error, info_span, Instrument};
 
 pub struct ZAIProvider {
     client: reqwest::Client,
@@ -34,60 +35,148 @@ impl ZAIProvider {
             client: reqwest::Client::new(),
         }
     }
+}
 
-    fn resolve_endpoint_url(
+impl Clone for ZAIProvider {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+        }
+    }
+}
+
+impl Provider for ZAIProvider {
+    fn handle_request(
         &self,
-        context: &ProviderExecutionContext,
-    ) -> Result<String, ProxyError> {
-        with_config(&context.config, |cfg| {
-            cfg.endpoint_url(context.provider(), context.endpoint_name())
-        })
-        .map_err(ProxyError::Config)
+        raw_request: ResponsesRequest,
+        normalized_request: ChatRequest,
+        _headers: HeaderMap,
+        context: ProviderExecutionContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
+    > {
+        Box::pin(self.execute_request(raw_request, normalized_request, context))
     }
 
-    async fn post_json<T: serde::Serialize>(
+    fn handle_compact(
         &self,
-        payload: &T,
-        auth: String,
-        context: &ProviderExecutionContext,
-    ) -> Result<reqwest::Response, ProxyError> {
-        let endpoint_url = self.resolve_endpoint_url(context)?;
-        self.client
-            .post(&endpoint_url)
-            .header("Authorization", auth)
-            .json(payload)
-            .timeout(std::time::Duration::from_secs(with_config(
-                &context.config,
-                |cfg| cfg.timeouts.read_seconds,
-            )))
-            .send()
-            .await
-            .map_err(ProxyError::Http)
+        data: crate::schema::openai::CompactRequest,
+        _headers: HeaderMap,
+        context: ProviderExecutionContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
+    > {
+        Box::pin(self.execute_compact(data, context))
     }
 
+    fn clone_box(&self) -> Box<dyn Provider + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+impl ZAIProvider {
     async fn execute_request(
         &self,
-        req: &ChatRequest,
-        headers: HeaderMap,
-        context: &ProviderExecutionContext,
+        raw: ResponsesRequest,
+        chat: ChatRequest,
+        context: ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
-        let auth = resolve_zai_auth(headers, context)?;
-        let mut ctx = ProviderBuildContext::new(context.upstream_model());
-        ctx.thinking_enabled = context.reasoning().map(|r| r.budget > 0);
-        let ProviderPayload::Zai(zai_req) =
-            build_provider_payload(ProviderKind::Zai, ProviderRequest::Chat(req), &ctx)
-                .map_err(|err| ProxyError::Internal(err.to_string()))?
-        else {
-            return Err(ProxyError::Internal(
-                "Z.AI provider expects Z.AI-compatible payload".into(),
-            ));
-        };
-        let resp = self.post_json(&zai_req, auth, context).await?;
+        let span = info_span!(
+            "zai_request",
+            model = %context.upstream_model(),
+            stream = %chat.stream,
+            account_id = %context.account.id
+        );
+
+        async move {
+            let auth_value = resolve_zai_auth(&context)?;
+
+            let base_url = resolve_endpoint_url(&context)?;
+            let url = build_messages_url(&base_url);
+
+            let is_stream = chat.stream;
+
+            let default_max_tokens = resolve_default_max_tokens(&context)?;
+
+            let ctx = TranslateCtx {
+                reasoning: context
+                    .reasoning()
+                    .cloned()
+                    .map(|r| crate::config::ReasoningConfig {
+                        effort_levels: r
+                            .preset
+                            .as_ref()
+                            .map(|p| {
+                                let mut m = HashMap::new();
+                                m.insert(
+                                    p.clone(),
+                                    crate::config::EffortLevel {
+                                        budget: r.budget,
+                                        level: r.level.clone(),
+                                    },
+                                );
+                                m
+                            })
+                            .unwrap_or_default(),
+                        default_effort: r.preset.clone(),
+                    }),
+                default_max_tokens,
+                stream: is_stream,
+            };
+
+            let session = TranslationSession::new();
+
+            let anthropic_req = translate_to_anthropic_request(&raw, &chat, &ctx);
+
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, auth_value);
+            headers.insert(
+                "Content-Type",
+                "application/json"
+                    .parse()
+                    .map_err(|_| ProxyError::Internal("Invalid content type".into()))?,
+            );
+
+            debug!("Z.AI request to {}", url);
+            debug!("Z.AI request body: {:?}", anthropic_req);
+
+            let resp = self
+                .client
+                .post(&url)
+                .headers(headers)
+                .json(&anthropic_req)
+                .send()
+                .await
+                .map_err(|e| {
+                    error!("Z.AI HTTP request failed: {}", e);
+                    ProxyError::Http(e)
+                })?;
+
+            let status = resp.status();
+            debug!("Z.AI response status: {}", status);
+
+            if is_stream {
+                self.handle_stream_response(resp, &chat, &context, session)
+                    .await
+            } else {
+                self.handle_sync_response(resp, context.upstream_model())
+                    .await
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn handle_sync_response(
+        &self,
+        resp: reqwest::Response,
+        model: &str,
+    ) -> Result<Response<Body>, ProxyError> {
         let status = resp.status();
-        info!("Z.AI response status: {}", status);
 
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            error!("Z.AI sync error: {} - {}", status, body);
             if status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN
             {
@@ -97,286 +186,251 @@ impl ZAIProvider {
                 )));
             }
             return Err(ProxyError::Provider(ProviderError::new(
-                Some(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY)),
-                format!("Z.AI request failed ({}): {}", status, body),
+                Some(status),
+                format!("Z.AI error: {} - {}", status, body),
             )));
         }
 
-        if req.stream {
-            self.handle_stream_response(resp, req, context).await
-        } else {
-            self.handle_sync_response(resp).await
-        }
+        let bytes = resp.bytes().await.map_err(|e| ProxyError::Http(e))?;
+
+        let anthropic_resp: AnthropicResponse = serde_json::from_slice(&bytes).map_err(|e| {
+            ProxyError::Internal(format!("Failed to parse Z.AI response: {}", e))
+        })?;
+
+        check_base_resp(&anthropic_resp, model)?;
+
+        let responses_resp = translate_to_responses_response(anthropic_resp);
+
+        let body = serde_json::to_string(&responses_resp)
+            .map_err(|e| ProxyError::Internal(format!("Failed to serialize response: {}", e)))?;
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .map_err(|e| ProxyError::Internal(e.to_string()))?)
     }
 
     async fn handle_stream_response(
         &self,
         resp: reqwest::Response,
-        req: &ChatRequest,
+        chat: &ChatRequest,
         context: &ProviderExecutionContext,
+        session: TranslationSession,
     ) -> Result<Response<Body>, ProxyError> {
-        let model = req.model.clone();
-        let created_ts = now_seconds();
-        let idle_timeout_seconds = with_config(&context.config, |cfg| cfg.timeouts.read_seconds);
-        let sse_stream = crate::providers::zai_stream::stream_responses_sse(
-            resp.bytes_stream(),
-            &model,
-            created_ts,
-            req,
-            idle_timeout_seconds,
+        let status = resp.status();
+
+        if !status.is_success() {
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            error!("Z.AI stream error: {} - {}", status, body_str);
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(ProxyError::Auth(format!(
+                    "Z.AI stream request unauthorized ({}). Body: {}",
+                    status, body_str
+                )));
+            }
+            return Err(ProxyError::Provider(ProviderError::new(
+                Some(status),
+                format!("Z.AI error: {} - {}", status, body_str),
+            )));
+        }
+
+        let idle_timeout = with_config(&context.config, |cfg| cfg.timeouts.read_seconds);
+
+        let model = context.upstream_model().to_string();
+        let created_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        debug!(
+            "SSE STREAM: building byte stream from response, idle_timeout={}",
+            idle_timeout
         );
-        let body = Body::from_stream(sse_stream);
+        let byte_stream = resp.bytes_stream();
+        let stream =
+            stream_responses_sse(byte_stream, &model, created_ts, chat, idle_timeout, session);
+        debug!("SSE STREAM: stream created, converting to body");
+
         Ok(Response::builder()
-            .status(200)
-            .header("Content-Type", "text/event-stream; charset=utf-8")
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .header("Cache-Control", "no-cache")
             .header("Connection", "keep-alive")
-            .body(body)
-            .unwrap())
+            .body(Body::from_stream(stream))
+            .map_err(|e| ProxyError::Internal(e.to_string()))?)
     }
 
-    async fn handle_sync_response(
+    async fn execute_compact(
         &self,
-        resp: reqwest::Response,
-    ) -> Result<Response<Body>, ProxyError> {
-        let body_bytes = resp.bytes().await?;
-        let z_data: ZaiChatResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
-            ProxyError::Provider(ProviderError::new(
-                None,
-                format!("Failed to decode Z.AI response JSON: {e}"),
-            ))
-        })?;
-
-        let out = map_zai_response_to_responses_api(&z_data);
-        Ok(axum::Json(out).into_response())
-    }
-}
-
-impl Provider for ZAIProvider {
-    fn handle_request(
-        &self,
-        _raw_request: ResponsesRequest,
-        data: ChatRequest,
-        headers: HeaderMap,
+        data: crate::schema::openai::CompactRequest,
         context: ProviderExecutionContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
-    > {
-        Box::pin(async move { self.execute_request(&data, headers, &context).await })
-    }
+    ) -> Result<Response<Body>, ProxyError> {
+        let model = context.upstream_model().to_string();
+        let synth_raw = ResponsesRequest {
+            model: model.clone(),
+            input: Some(data.input.clone()),
+            instructions: Some(data.instructions.clone()),
+            messages: None,
+            previous_response_id: None,
+            store: None,
+            metadata: None,
+            tools: None,
+            tool_choice: None,
+            stream: Some(false),
+            temperature: Some(0.1),
+            top_p: None,
+            max_tokens: Some(resolve_default_max_tokens(&context)?),
+            max_output_tokens: None,
+            include: None,
+        };
+        let synth_chat = normalize_responses_request(&synth_raw);
+        let _session = TranslationSession::new();
+        let anth_req = translate_to_anthropic_request(
+            &synth_raw,
+            &synth_chat,
+            &TranslateCtx {
+                stream: false,
+                default_max_tokens: resolve_default_max_tokens(&context)?,
+                reasoning: None,
+            },
+        );
 
-    fn clone_box(&self) -> Box<dyn Provider + Send + Sync> {
-        Box::new(ZAIProvider {
-            client: self.client.clone(),
-        })
+        let auth = resolve_zai_auth(&context)?;
+        let url = build_messages_url(&resolve_endpoint_url(&context)?);
+
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert(AUTHORIZATION, auth);
+        req_headers.insert(
+            "Content-Type",
+            "application/json"
+                .parse()
+                .map_err(|_| ProxyError::Internal("Invalid content type".into()))?,
+        );
+
+        debug!("Z.AI compact request to {}", url);
+
+        let resp = self
+            .client
+            .post(&url)
+            .headers(req_headers)
+            .json(&anth_req)
+            .send()
+            .await
+            .map_err(|e| ProxyError::Http(e))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            error!("Z.AI compact error: {} - {}", status, body);
+            return Err(ProxyError::Provider(ProviderError::new(
+                Some(status),
+                format!("Z.AI compact error: {} - {}", status, body),
+            )));
+        }
+
+        let bytes = resp.bytes().await.map_err(|e| ProxyError::Http(e))?;
+        let anth: AnthropicResponse = serde_json::from_slice(&bytes).map_err(|e| {
+            ProxyError::Internal(format!("Failed to parse Z.AI compact response: {}", e))
+        })?;
+        check_base_resp(&anth, &model)?;
+
+        let summary = anth
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                AnthropicResponseBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let response_obj = ResponseObject {
+            id: format!("cmp_{}", anth.id),
+            object: "response",
+            created_at: timestamp,
+            completed_at: Some(timestamp),
+            model: anth.model,
+            status: "completed".to_string(),
+            temperature: 0.0,
+            top_p: 0.0,
+            tool_choice: String::new(),
+            tools: Vec::new(),
+            parallel_tool_calls: false,
+            store: false,
+            metadata: Default::default(),
+            output: vec![OutputItem::Message(MessageItem {
+                id: format!("msg_{}", timestamp),
+                role: "assistant",
+                status: "completed".to_string(),
+                content: vec![OutputContentPart::OutputText { text: summary }],
+            })],
+            usage: anth.usage.map(|u| Usage {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                total_tokens: u.input_tokens + u.output_tokens,
+                input_tokens_details: None,
+                output_tokens_details: None,
+            }),
+        };
+
+        Ok(axum::Json(response_obj).into_response())
     }
 }
 
-fn resolve_zai_auth(
-    headers: HeaderMap,
-    context: &ProviderExecutionContext,
-) -> Result<String, ProxyError> {
+fn resolve_zai_auth(context: &ProviderExecutionContext) -> Result<HeaderValue, ProxyError> {
     match &context.account.auth {
-        AccountAuth::ApiKey { api_key } if !api_key.is_empty() => Ok(format!("Bearer {api_key}")),
-        _ if with_config(&context.config, |cfg| {
-            cfg.zai_provider_config(context.provider())
-                .map(|provider| provider.allow_authorization_passthrough)
-        })
-        .map_err(ProxyError::Config)?
-            => headers
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .ok_or_else(|| {
-                ProxyError::Auth(
-                    "Missing Z.AI API key. Configure the account auth or enable Authorization passthrough."
-                        .into(),
-                )
-            }),
-        _ => Err(ProxyError::Auth(
-            "Missing Z.AI API key. Configure the account auth for this Z.AI account.".into(),
+        crate::account_pool::AccountAuth::ApiKey { api_key } => {
+            Ok(HeaderValue::from_str(&format!("Bearer {}", api_key))
+                .map_err(|_| ProxyError::Auth("Invalid API key".into()))?)
+        }
+        crate::account_pool::AccountAuth::GeminiOAuth { .. } => Err(ProxyError::Auth(
+            "Z.AI provider does not support OAuth authentication".into(),
         )),
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct ZaiChatResponse {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    created: Option<i64>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    choices: Vec<ZaiChoice>,
-    #[serde(default)]
-    usage: Option<ZaiUsage>,
+fn resolve_endpoint_url(context: &ProviderExecutionContext) -> Result<String, ProxyError> {
+    with_config(&context.config, |cfg| {
+        cfg.endpoint_url(context.provider(), context.endpoint_name())
+    })
+    .map_err(ProxyError::Config)
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct ZaiChoice {
-    #[serde(default)]
-    message: Option<ZaiChoiceMessage>,
+fn resolve_default_max_tokens(context: &ProviderExecutionContext) -> Result<u64, ProxyError> {
+    with_config(&context.config, |cfg| {
+        cfg.zai_provider_config(context.provider())
+            .map(|c| c.default_max_tokens)
+    })
+    .map_err(ProxyError::Config)
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct ZaiChoiceMessage {
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<ZaiToolCall>,
+fn build_messages_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    format!("{}/anthropic/v1/messages", base)
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct ZaiToolCall {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    function: Option<ZaiToolCallFn>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[derive(Clone, Debug, Deserialize)]
-struct ZaiToolCallFn {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    arguments: Option<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ZaiUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-    #[serde(default)]
-    total_tokens: Option<u64>,
-}
-
-fn map_zai_response_to_responses_api(z: &ZaiChatResponse) -> ResponseObject {
-    let created = z.created.unwrap_or(0);
-    let model = z.model.clone().unwrap_or_else(|| "unknown".into());
-    let resp_id = format!("zai_{}", z.id.clone().unwrap_or_else(|| "unknown".into()));
-
-    let mut output: Vec<OutputItem> = Vec::new();
-
-    if let Some(choice) = z.choices.first()
-        && let Some(msg) = &choice.message
-    {
-        for (idx, tc) in msg.tool_calls.iter().enumerate() {
-            let call_id = tc
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("call_{}_{}", now_ms(), idx));
-            let name = tc
-                .function
-                .as_ref()
-                .and_then(|f| f.name.clone())
-                .unwrap_or_default();
-            let args = tc
-                .function
-                .as_ref()
-                .and_then(|f| f.arguments.as_ref())
-                .map(|a| serde_json::to_string(a).unwrap_or_default())
-                .unwrap_or_else(|| "{}".into());
-
-            let item = if name == "shell" || name == "container.exec" || name == "shell_command" {
-                let cmd = extract_command_from_args(&args);
-                OutputItem::LocalShellCall(LocalShellCallItem {
-                    id: call_id.clone(),
-                    status: "completed".into(),
-                    name,
-                    arguments: args,
-                    call_id: call_id.clone(),
-                    action: crate::schema::sse::ShellAction {
-                        action_type: "exec",
-                        command: cmd,
-                    },
-                    thought_signature: None,
-                })
-            } else {
-                OutputItem::FunctionCall(FunctionCallItem {
-                    id: call_id.clone(),
-                    status: "completed".into(),
-                    name,
-                    arguments: args,
-                    call_id: call_id.clone(),
-                    thought_signature: None,
-                    namespace: None,
-                })
-            };
-            output.push(item);
-        }
-
-        if let Some(content) = msg.content.as_deref()
-            && !content.is_empty()
-        {
-            output.push(OutputItem::Message(MessageItem {
-                id: format!("msg_{}", now_ms()),
-                role: "assistant",
-                status: "completed".into(),
-                content: vec![OutputContentPart::OutputText {
-                    text: content.to_string(),
-                }],
-            }));
-        }
+    #[test]
+    fn test_build_messages_url() {
+        assert_eq!(
+            build_messages_url("https://open.bigmodel.cn"),
+            "https://open.bigmodel.cn/anthropic/v1/messages"
+        );
+        assert_eq!(
+            build_messages_url("https://open.bigmodel.cn/"),
+            "https://open.bigmodel.cn/anthropic/v1/messages"
+        );
     }
-
-    let usage = z.usage.as_ref().map(|u| {
-        let prompt = u.prompt_tokens.unwrap_or(0);
-        let completion = u.completion_tokens.unwrap_or(0);
-        let total = u.total_tokens.unwrap_or(prompt + completion);
-        Usage {
-            input_tokens: prompt,
-            output_tokens: completion,
-            total_tokens: total,
-            input_tokens_details: None,
-            output_tokens_details: None,
-        }
-    });
-
-    ResponseObject {
-        id: resp_id,
-        object: "response",
-        created_at: created,
-        completed_at: None,
-        model,
-        status: "completed".into(),
-        temperature: 1.0,
-        top_p: 1.0,
-        tool_choice: "auto".into(),
-        tools: Vec::new(),
-        parallel_tool_calls: true,
-        store: false,
-        metadata: Default::default(),
-        output,
-        usage,
-    }
-}
-
-fn extract_command_from_args(args: &str) -> Vec<String> {
-    let parsed: Result<serde_json::Value, _> = serde_json::from_str(args);
-    match parsed {
-        Ok(serde_json::Value::Object(map)) => match map.get("command") {
-            Some(serde_json::Value::Array(arr)) => arr
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect(),
-            _ => Vec::new(),
-        },
-        _ => Vec::new(),
-    }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn now_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
