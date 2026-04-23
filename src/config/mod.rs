@@ -174,6 +174,12 @@ pub struct ZaiProviderConfig {
     pub allow_authorization_passthrough: bool,
     #[serde(default)]
     pub models: Vec<String>,
+    #[serde(default = "default_max_tokens")]
+    pub default_max_tokens: u64,
+}
+
+fn default_max_tokens() -> u64 {
+    4096
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +228,8 @@ pub enum ProviderConfig {
         allow_authorization_passthrough: bool,
         #[serde(default)]
         models: Vec<String>,
+        #[serde(default)]
+        default_max_tokens: Option<u64>,
     },
     #[serde(rename = "openai", alias = "open_ai")]
     OpenAi {
@@ -313,11 +321,13 @@ impl ProviderConfig {
                 endpoints,
                 allow_authorization_passthrough,
                 models,
+                default_max_tokens,
             } => Some(ZaiProviderConfig {
                 api_url: api_url.clone(),
                 endpoints: endpoints.clone(),
                 allow_authorization_passthrough: *allow_authorization_passthrough,
                 models: models.clone(),
+                default_max_tokens: default_max_tokens.unwrap_or(4096),
             }),
             _ => None,
         }
@@ -1159,6 +1169,7 @@ impl Config {
                 endpoints: HashMap::new(),
                 allow_authorization_passthrough: false,
                 models: Vec::new(),
+                default_max_tokens: None,
             },
         );
         providers.insert(
