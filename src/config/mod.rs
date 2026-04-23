@@ -2228,6 +2228,7 @@ mod tests {
                         endpoints: HashMap::from([("fast".into(), "https://z.ai/fast".into())]),
                         allow_authorization_passthrough: false,
                         models: vec!["glm-4.6".into()],
+                        default_max_tokens: Some(4096),
                     },
                 ),
                 (

@@ -525,6 +525,10 @@ fn translate_content_to_text(content: &Content) -> String {
 }
 
 fn translate_tools(tools: &[Tool]) -> Vec<AnthropicTool> {
+    tracing::debug!("translate_tools called with {} tools", tools.len());
+    for (i, tool) in tools.iter().enumerate() {
+        tracing::debug!("  tool[{}]: type={:?}, name={:?}", i, tool.tool_type, tool.name);
+    }
     tools
         .iter()
         .flat_map(|tool| {
