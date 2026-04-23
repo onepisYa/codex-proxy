@@ -297,10 +297,6 @@ impl StreamState {
                     call_id
                 );
 
-                // Store the mapping: MiniMax's call_id -> our tool_use.id (by position)
-                // This allows us to look up our original ID when processing function_call_output
-                self.session.store_minimax_call_id(&call_id);
-
                 let name = block_start.content_block.name.clone().unwrap_or_default();
 
                 self.blocks.insert(

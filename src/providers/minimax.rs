@@ -130,10 +130,10 @@ impl MinimaxProvider {
             };
 
             // Create translation session for this request
-            let mut session = TranslationSession::new();
+            let session = TranslationSession::new();
 
             // Translate request
-            let anthropic_req = translate_to_anthropic_request(&raw, &chat, &ctx, &mut session);
+            let anthropic_req = translate_to_anthropic_request(&raw, &chat, &ctx);
 
             // Build headers
             let mut headers = HeaderMap::new();
@@ -299,7 +299,7 @@ impl MinimaxProvider {
             include: None,
         };
         let synth_chat = normalize_responses_request(&synth_raw);
-        let mut session = TranslationSession::new();
+        let _session = TranslationSession::new();
         let anth_req = translate_to_anthropic_request(
             &synth_raw,
             &synth_chat,
@@ -308,7 +308,6 @@ impl MinimaxProvider {
                 default_max_tokens: resolve_default_max_tokens(&context)?,
                 reasoning: None,
             },
-            &mut session,
         );
 
         // 2. Send non-streaming Minimax request

@@ -1,5 +1,4 @@
 use crate::error::{ProviderError, ProxyError};
-use crate::providers::minimax_session::TranslationSession;
 use crate::schema::sse::ResponseObject;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -161,9 +160,7 @@ pub fn translate_to_anthropic_request(
     raw: &ResponsesRequest,
     chat: &ChatRequest,
     ctx: &TranslateCtx,
-    session: &mut TranslationSession,
 ) -> AnthropicRequest {
-    // session is provided per-request, no reset needed
 
     // Pre-pass: collect all function_call ids in order so we can map them later
     // during SSE stream processing (MiniMax may send back call_id different from ours)
@@ -333,12 +330,6 @@ pub fn translate_to_anthropic_request(
                     .or_else(|| item.id.clone())
                     .unwrap_or_else(|| crate::providers::minimax_stream::generate_tool_id());
 
-                // Store mapping: Codex call_id -> our tool_use.id
-                // This allows us to find our tool_use.id when processing function_call_output
-                if let Some(ref codex_call_id) = item.call_id {
-                    session.store_codex_call_id(codex_call_id, &id);
-                }
-
                 // Add tool_use block
                 let tool_block = AnthropicContentBlock::ToolUse {
                     id: id.clone(),
@@ -365,29 +356,14 @@ pub fn translate_to_anthropic_request(
             }
             "function_call_output" => {
                 // type: "function_call_output" → merge into user message content
-                // NOTE: item.call_id is MiniMax's call_id from the original tool_use SSE event.
-                // We stored minimax_call_id -> tool_use.id mapping during SSE processing.
+                // item.call_id is MiniMax's tool_use.id from the original tool_use SSE event.
+                // We use it directly as tool_use_id (no session mapping needed).
                 let Some(minimax_call_id) = item.call_id.clone() else {
-                    // Skip function_call_output with missing call_id - we cannot
-                    // reliably correlate it without the upstream's ID.
                     i += 1;
                     continue;
                 };
 
                 tracing::debug!(" Codex function_call_output call_id: {:?}", minimax_call_id);
-
-                // Look up our original tool_use.id using MiniMax's call_id
-                // This mapping was stored during SSE processing when we received tool_use from MiniMax
-                let tool_use_id = session
-                    .lookup_our_tool_use_id(&minimax_call_id)
-                    .unwrap_or_else(|| {
-                        // This is a bug - the mapping should have been stored during SSE processing
-                        tracing::warn!(
-                            "Tool_use ID mapping not found for minimax_call_id={}, this is a bug!",
-                            minimax_call_id
-                        );
-                        minimax_call_id.clone()
-                    });
 
                 let output_content = item
                     .output
@@ -396,7 +372,7 @@ pub fn translate_to_anthropic_request(
                     .unwrap_or_default();
 
                 let tool_result = AnthropicContentBlock::ToolResult {
-                    tool_use_id,
+                    tool_use_id: minimax_call_id,
                     content: output_content,
                 };
 
@@ -460,28 +436,6 @@ pub fn translate_to_anthropic_request(
             content: AnthropicMessageContent::Text("hello".to_string()),
         });
     }
-
-    // Post-pass: collect actual tool_use ids from the built messages (in order)
-    // This is needed because we generate tool_use.id during translation, not in a pre-pass.
-    // The sequence matches MiniMax's SSE call_id sequence 1:1.
-    let tool_use_ids: Vec<String> = anthropic_messages
-        .iter()
-        .filter_map(|msg| {
-            if let AnthropicMessageContent::Blocks(blocks) = &msg.content {
-                Some(blocks.iter().filter_map(|b| {
-                    if let AnthropicContentBlock::ToolUse { id, .. } = b {
-                        Some(id.clone())
-                    } else {
-                        None
-                    }
-                }))
-            } else {
-                None
-            }
-        })
-        .flatten()
-        .collect();
-    session.set_our_tool_use_ids(tool_use_ids);
 
     // Build system prompt
     let system = if system_parts.is_empty() {
@@ -932,8 +886,7 @@ mod tests {
             stream: false,
         };
 
-        let mut session = TranslationSession::new();
-        let req = translate_to_anthropic_request(&raw, &chat, &ctx, &mut session);
+        let req = translate_to_anthropic_request(&raw, &chat, &ctx);
 
         assert!(req.system.is_some());
         assert!(req.system.unwrap().contains("helpful assistant"));
@@ -1007,8 +960,7 @@ mod tests {
             stream: false,
         };
 
-        let mut session = TranslationSession::new();
-        let req = translate_to_anthropic_request(&raw, &chat, &ctx, &mut session);
+        let req = translate_to_anthropic_request(&raw, &chat, &ctx);
 
         assert!(req.system.is_some());
         let system = req.system.unwrap();
@@ -1131,8 +1083,7 @@ mod tests {
             stream: false,
         };
 
-        let mut session = TranslationSession::new();
-        let req = translate_to_anthropic_request(&raw, &chat, &ctx, &mut session);
+        let req = translate_to_anthropic_request(&raw, &chat, &ctx);
 
         // Should have user message, assistant message with tool_use, user message with tool_result
         assert_eq!(req.messages.len(), 3);
@@ -1325,8 +1276,7 @@ mod tests {
             stream: false,
         };
 
-        let mut session = TranslationSession::new();
-        let req = translate_to_anthropic_request(&raw, &chat, &ctx, &mut session);
+        let req = translate_to_anthropic_request(&raw, &chat, &ctx);
 
         // Should include the text with URL
         assert_eq!(req.messages.len(), 1);
